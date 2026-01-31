@@ -1,0 +1,2458 @@
+#!/bin/bash
+# shrink_all_mkv - Compress MKV files using AV1 encoder
+# Version: 3.2.1
+# Features:
+# - Auto-detect best AV1 encoder (libsvtav1, libaom-av1, librav1e)
+# - Codec detection and smart conversion decisions
+# - Adaptive CRF based on source quality
+# - Interactive mode with fzf
+# - Per-file progress with ETA
+# - Built-in parallel processing
+# - Hardware AV1 encoding support (NVIDIA, Intel, AMD)
+# - Configuration file support
+# - Dry-run mode
+# - Desktop notifications
+# - Resume capability
+# - Enhanced logging
+# Usage: shrink_all_mkv [options] [target_folder]
+
+set -o pipefail
+
+VERSION="3.2.1"
+
+#####################################################
+# COLORS
+#####################################################
+C_CYAN="\033[1;36m"
+C_GREEN="\033[1;32m"
+C_RED="\033[1;31m"
+C_YELLOW="\033[1;33m"
+C_BLUE="\033[1;34m"
+C_MAGENTA="\033[1;35m"
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+
+#####################################################
+# LOGGING AND UTILITY FUNCTIONS
+#####################################################
+log() { [[ "$QUIET" == true ]] || echo -e "${C_CYAN}$1${C_RESET}"; }
+success() { [[ "$QUIET" == true ]] || echo -e "${C_GREEN}$1${C_RESET}"; }
+warn() { [[ "$QUIET" == true ]] || echo -e "${C_YELLOW}$1${C_RESET}"; }
+err() { echo -e "${C_RED}$1${C_RESET}" >&2; exit 1; }
+info() { [[ "$QUIET" == true ]] || echo -e "${C_BLUE}$1${C_RESET}"; }
+need() { command -v "$1" >/dev/null || err "❌ '$1' is required. Install it first."; }
+
+#####################################################
+# PLATFORM-SPECIFIC CONFIGURATIONS
+#####################################################
+if [[ "$(uname)" == "Darwin" ]]; then
+  CPU_THREADS=$(sysctl -n hw.ncpu)
+  STAT_CMD="stat -f%z"
+elif [[ "$(uname)" == "Linux" ]]; then
+  CPU_THREADS=$(nproc)
+  STAT_CMD="stat --format=%s"
+else
+  err "⚠️ Unsupported platform: $(uname)"
+fi
+
+#####################################################
+# DEFAULT OPTIONS
+#####################################################
+PRESET="6"              # Default preset for SVT-AV1 (0-13, higher is faster)
+CRF=""                  # CRF value (auto-detect if empty)
+JOBS=4                  # Number of parallel jobs
+QUIET=false             # Quiet mode
+HELP=false              # Help flag
+LIST_CODECS=false       # List codecs mode
+INTERACTIVE=false       # Interactive mode
+AUTO_CRF=true           # Automatic CRF detection
+ENCODER=""              # AV1 encoder (auto-detect if empty)
+SKIP_CODECS=()          # Codecs to skip conversion
+TARGET_FOLDER=""
+PROGRESS_FILE=""   # set in target directory after TARGET_FOLDER is known
+
+# Feature flags
+DRY_RUN=false
+SEND_NOTIFICATIONS=false
+STATE_FILE=""      # set in target directory after TARGET_FOLDER is known
+LOG_FILE=""        # set in target directory after TARGET_FOLDER is known
+
+# Advanced features
+CALCULATE_VMAF=false
+CHECK_DISK_SPACE=false
+SHOW_BATCH_ETA=true
+
+# Hardware & optimization features
+USE_HARDWARE=false
+HW_ENCODER=""
+HW_DECODE=false
+HW_DECODE_DEVICE=""
+ENABLE_VARBOOST=true
+TUNE_GRAIN=false
+USE_GNU_PARALLEL=false  # Auto-detected below
+AUTO_JOBS=false
+FORCE_10BIT=false
+RECURSIVE=false
+
+# Configuration file location
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/shrink_mkv/config"
+
+# Load configuration if exists
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+#####################################################
+# ENCODER DETECTION
+#####################################################
+detect_av1_encoder() {
+    local encoder=""
+    local encoders_list
+    encoders_list=$(ffmpeg -hide_banner -encoders 2>&1)
+    
+    # Check for available AV1 encoders in order of preference
+    # Use word boundaries to match exact encoder names
+    if echo "$encoders_list" | grep -qw "libsvtav1"; then
+        encoder="libsvtav1"
+    elif echo "$encoders_list" | grep -qw "libaom-av1"; then
+        encoder="libaom-av1"
+    elif echo "$encoders_list" | grep -qw "librav1e"; then
+        encoder="librav1e"
+    else
+        echo "" >&2
+        echo "Available encoders in your ffmpeg:" >&2
+        echo "$encoders_list" | grep -i av1 >&2
+        echo "" >&2
+        err "❌ No AV1 encoder found! Install ffmpeg with AV1 support (libsvtav1 recommended)"
+    fi
+    
+    echo "$encoder"
+}
+
+#####################################################
+# CODEC DETECTION
+#####################################################
+get_video_info() {
+    local file="$1"
+    
+    # Two ffprobe calls instead of six separate calls
+    local stream_data
+    local duration
+    local codec
+    local bitrate
+    local width
+    local height
+    local fps_frac
+    local pix_fmt
+
+    stream_data=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,bit_rate,width,height,r_frame_rate,pix_fmt \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+    duration=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+    codec=$(echo "$stream_data" | sed -n '1p')
+    bitrate=$(echo "$stream_data" | sed -n '2p')
+    width=$(echo "$stream_data" | sed -n '3p')
+    height=$(echo "$stream_data" | sed -n '4p')
+    fps_frac=$(echo "$stream_data" | sed -n '5p')
+    pix_fmt=$(echo "$stream_data" | sed -n '6p')
+    
+    # Calculate FPS from fraction
+    local fps="0"
+    if [[ "$fps_frac" =~ ^[0-9]+/[0-9]+$ ]]; then
+        fps=$(echo "$fps_frac" | awk -F'/' '{if ($2 != 0) printf "%.2f", $1/$2; else print "0"}')
+    fi
+    
+    # Default empty values
+    [ -z "$bitrate" ] && bitrate="N/A"
+    [ -z "$pix_fmt" ] && pix_fmt="yuv420p"
+    
+    echo "${codec}|${bitrate}|${width}|${height}|${fps}|${duration}|${pix_fmt}"
+}
+
+should_skip_file() {
+    local file="$1"
+    local info
+    local codec
+    info=$(get_video_info "$file")
+    codec=$(echo "$info" | cut -d'|' -f1)
+    
+    # Skip if already AV1
+    if [[ "$codec" == "av1" ]]; then
+        warn "⏭️  Skipping $(basename "$file") (already AV1)"
+        return 0
+    fi
+    
+    # Skip if codec is in skip list
+    for skip_codec in "${SKIP_CODECS[@]}"; do
+        if [[ "$codec" == "$skip_codec" ]]; then
+            warn "⏭️  Skipping $(basename "$file") (codec: $codec)"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+get_codec_friendly_name() {
+    local codec="$1"
+    case "$codec" in
+        h264) echo "H.264/AVC" ;;
+        hevc) echo "H.265/HEVC" ;;
+        mpeg1video) echo "MPEG-1" ;;
+        mpeg2video) echo "MPEG-2" ;;
+        mpeg4) echo "MPEG-4" ;;
+        vc1) echo "VC-1" ;;
+        vp8) echo "VP8" ;;
+        vp9) echo "VP9" ;;
+        theora) echo "Theora" ;;
+        av1) echo "AV1" ;;
+        *) echo "$codec" ;;
+    esac
+}
+
+#####################################################
+# UTILITY FUNCTIONS
+#####################################################
+
+log_to_file() {
+    if [ -n "$LOG_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null
+    fi
+}
+
+send_notification() {
+    if [[ "$SEND_NOTIFICATIONS" != true ]]; then
+        return 0
+    fi
+    
+    local title="$1"
+    local message="$2"
+    
+    # Try notify-send (Linux)
+    if command -v notify-send &>/dev/null; then
+        notify-send "$title" "$message" 2>/dev/null &
+        return 0
+    fi
+    
+    # Try osascript (macOS)
+    if command -v osascript &>/dev/null; then
+        osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null &
+        return 0
+    fi
+}
+
+save_state() {
+    local current_file="$1"
+    if [ -n "$STATE_FILE" ] && [ -n "$current_file" ]; then
+        echo "$current_file" > "$STATE_FILE" 2>/dev/null
+    fi
+}
+
+load_state() {
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE" 2>/dev/null
+    fi
+}
+
+clear_state() {
+    if [ -f "$STATE_FILE" ]; then
+        rm -f "$STATE_FILE" 2>/dev/null
+    fi
+}
+
+#####################################################
+# ADVANCED FEATURES
+#####################################################
+
+check_disk_space() {
+    if [[ "$CHECK_DISK_SPACE" != true ]]; then
+        return 0
+    fi
+    
+    local file="$1"
+    local file_size
+    local target_dir
+    local free_space
+    local required
+
+    file_size=$($STAT_CMD "$file" 2>/dev/null)
+    
+    if [ -z "$file_size" ]; then
+        return 0  # Can't check, proceed anyway
+    fi
+    
+    target_dir=$(dirname "$file")
+    
+    # Get free space in bytes
+    if [[ "$(uname)" == "Darwin" ]]; then
+        free_space=$(df -k "$target_dir" 2>/dev/null | tail -1 | awk '{print $4}')
+        free_space=$((free_space * 1024))
+    else
+        free_space=$(df --output=avail "$target_dir" 2>/dev/null | tail -1)
+        free_space=$((free_space * 1024))
+    fi
+    
+    # Need at least 2x file size for safety
+    required=$((file_size * 2))
+    
+    if [ "$free_space" -lt "$required" ]; then
+        warn "⚠️  Insufficient disk space for $(basename "$file")"
+        warn "   Required: $(numfmt --to=iec $required), Available: $(numfmt --to=iec $free_space)"
+        return 1
+    fi
+    
+    return 0
+}
+
+calculate_vmaf() {
+    if [[ "$CALCULATE_VMAF" != true ]]; then
+        return 0
+    fi
+    
+    local original="$1"
+    local encoded="$2"
+    local vmaf
+    
+    # Check if libvmaf is available
+    if ! ffmpeg -hide_banner -filters 2>&1 | grep -q "libvmaf"; then
+        return 0
+    fi
+    
+    info "   📊 Calculating VMAF score..."
+    
+    vmaf=$(ffmpeg -i "$encoded" -i "$original" \
+        -lavfi "libvmaf=log_fmt=json:log_path=/dev/stdout:n_threads=4" \
+        -f null - 2>&1 | \
+        grep -oP '"vmaf".*?mean.*?\K[0-9.]+' | head -1)
+    
+    if [ -n "$vmaf" ]; then
+        echo "$vmaf"
+        return 0
+    fi
+    
+    return 1
+}
+
+estimate_batch_time() {
+    # Skip in sequential mode - progress is visible anyway
+    if [ "$JOBS" -eq 1 ]; then
+        return 0
+    fi
+    
+    if [[ "$SHOW_BATCH_ETA" != true ]]; then
+        return 0
+    fi
+    
+    local files=("$@")
+    local total_duration=0
+    local file_count=0
+    
+    # Sample first 5 files to estimate average duration
+    local sample_limit=5
+    for file in "${files[@]}"; do
+        if [ $file_count -ge $sample_limit ]; then
+            break
+        fi
+        
+        local info
+        info=$(get_video_info "$file")
+        local duration
+        duration=$(echo "$info" | cut -d'|' -f6)
+        
+        if [ -n "$duration" ] && [ "$duration" != "N/A" ]; then
+            total_duration=$(awk -v t="$total_duration" -v d="$duration" 'BEGIN {print t + d}')
+            file_count=$((file_count + 1))
+        fi
+    done
+    
+    if [ $file_count -eq 0 ]; then
+        return 0
+    fi
+    
+    # Calculate average and extrapolate
+    local avg_duration
+    avg_duration=$(awk -v t="$total_duration" -v c="$file_count" 'BEGIN {print t / c}')
+    local total_est
+    total_est=$(awk -v avg="$avg_duration" -v total="${#files[@]}" 'BEGIN {print avg * total}')
+    
+    # Estimate encoding time (assume 20 fps encoding speed)
+    local est_seconds
+    est_seconds=$(awk -v d="$total_est" 'BEGIN {printf "%.0f", d / 20}')
+    
+    # Adjust for parallel jobs
+    est_seconds=$((est_seconds / JOBS))
+    
+    local hours=$((est_seconds / 3600))
+    local minutes=$(((est_seconds % 3600) / 60))
+    
+    if [ $hours -gt 0 ]; then
+        info "⏱️  Estimated batch time: ${hours}h ${minutes}m (${#files[@]} files, $JOBS jobs)"
+    else
+        info "⏱️  Estimated batch time: ${minutes}m (${#files[@]} files, $JOBS jobs)"
+    fi
+}
+
+#####################################################
+# HARDWARE ACCELERATION & ADVANCED FEATURES
+#####################################################
+
+detect_hardware_av1_encoder() {
+    local hw_encoder=""
+    
+    # Check for NVIDIA NVENC AV1 (RTX 40-series)
+    if ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_nvenc"; then
+        # Verify it's actually available (RTX 40-series)
+        if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qi "rtx 40\|rtx 50"; then
+            hw_encoder="av1_nvenc"
+            log_to_file "Detected NVIDIA RTX 40-series with AV1 support"
+        fi
+    fi
+    
+    # Check for Intel QSV AV1 (ARC GPU)
+    if [ -z "$hw_encoder" ] && ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_qsv"; then
+        # Check for ARC GPU
+        if lspci 2>/dev/null | grep -qi "arc\|alchemist\|battlemage"; then
+            hw_encoder="av1_qsv"
+            log_to_file "Detected Intel ARC GPU with AV1 support"
+        fi
+    fi
+    
+    # Check for VAAPI AV1 (Intel ARC / AMD RDNA3)
+    if [ -z "$hw_encoder" ] && ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_vaapi"; then
+        if [ -e /dev/dri/renderD128 ]; then
+            hw_encoder="av1_vaapi"
+            log_to_file "Detected VAAPI AV1 support"
+        fi
+    fi
+    
+    echo "$hw_encoder"
+}
+
+detect_hardware_decode() {
+    hw_decode_device=""
+    
+    # Check for AMD GPU (VAAPI for decoding)
+    if lspci 2>/dev/null | grep -qi "amd\|radeon"; then
+        if [ -e /dev/dri/renderD128 ]; then
+            hw_decode_device="vaapi"
+            log_to_file "Detected AMD GPU with hardware decode support (VAAPI)"
+            return 0
+        fi
+    fi
+    
+    # Check for NVIDIA GPU (NVDEC for decoding - works on most modern cards)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local gpu_name
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        if [ -n "$gpu_name" ]; then
+            # Most NVIDIA GPUs from GTX 900 series onwards support NVDEC
+            hw_decode_device="cuda"
+            log_to_file "Detected NVIDIA GPU with hardware decode support (NVDEC): $gpu_name"
+            return 0
+        fi
+    fi
+    
+    # Check for Intel GPU (QSV for decoding)
+    if lspci 2>/dev/null | grep -qi "intel.*vga\|intel.*display"; then
+        if [ -e /dev/dri/renderD128 ]; then
+            hw_decode_device="qsv"
+            log_to_file "Detected Intel GPU with hardware decode support (QSV)"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+show_hardware_info() {
+    echo ""
+    log "╔════════════════════════════════════════════════════════════╗"
+    log "║           HARDWARE ACCELERATION DETECTION                  ║"
+    log "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    # Check for hardware encoders
+    info "🔍 Checking for hardware AV1 encoders..."
+    echo ""
+    
+    local found_any=false
+    
+    # NVIDIA
+    if ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_nvenc"; then
+        local gpu_name
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        if [ -n "$gpu_name" ]; then
+            if echo "$gpu_name" | grep -qi "rtx 40\|rtx 50"; then
+                success "✅ NVIDIA: $gpu_name (AV1 supported)"
+                info "   Encoder: av1_nvenc"
+                info "   Speed: 50-100x faster than CPU"
+                found_any=true
+            else
+                warn "⚠️  NVIDIA: $gpu_name (no AV1 support)"
+                info "   Note: AV1 requires RTX 40-series or newer"
+            fi
+        fi
+    fi
+    
+    # Intel
+    if ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_qsv"; then
+        local gpu_info
+        gpu_info=$(lspci 2>/dev/null | grep -i "vga\|display" | grep -i "intel")
+        if echo "$gpu_info" | grep -qi "arc\|alchemist\|battlemage"; then
+            success "✅ Intel: ARC GPU detected (AV1 supported)"
+            info "   Encoder: av1_qsv"
+            info "   Speed: 30-70x faster than CPU"
+            found_any=true
+        elif [ -n "$gpu_info" ]; then
+            warn "⚠️  Intel: Integrated GPU (no AV1 support)"
+            info "   Note: AV1 requires ARC or newer"
+        fi
+    fi
+    
+    # VAAPI
+    if ffmpeg -hide_banner -encoders 2>&1 | grep -qw "av1_vaapi"; then
+        if [ -e /dev/dri/renderD128 ]; then
+            success "✅ VAAPI: AV1 encoder available"
+            info "   Encoder: av1_vaapi"
+            info "   Speed: 25-50x faster than CPU"
+            found_any=true
+        fi
+    fi
+    
+    if [ "$found_any" = false ]; then
+        warn "❌ No hardware AV1 encoders detected"
+        info "   Supported hardware:"
+        info "   • NVIDIA RTX 40-series or newer"
+        info "   • Intel ARC A/B-series"
+        info "   • AMD RDNA3 (RX 7000 series)"
+        info ""
+        info "   Using CPU encoder: libsvtav1"
+    fi
+    
+    echo ""
+    info "💡 To enable hardware encoding: --hw-encoder"
+    echo ""
+    
+    # Check for hardware decode support
+    info "🔍 Checking for hardware decode support..."
+    echo ""
+    
+    local decode_found=false
+    
+    # Check AMD
+    if lspci 2>/dev/null | grep -qi "amd\|radeon"; then
+        local gpu_info
+        gpu_info=$(lspci 2>/dev/null | grep -i "vga\|display" | grep -i "amd\|radeon")
+        if [ -n "$gpu_info" ] && [ -e /dev/dri/renderD128 ]; then
+            success "✅ AMD GPU: Hardware decode available (VAAPI)"
+            info "   Benefit: 15-25% faster encoding (frees up CPU)"
+            decode_found=true
+        fi
+    fi
+    
+    # Check NVIDIA
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local gpu_name
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        if [ -n "$gpu_name" ]; then
+            success "✅ NVIDIA: $gpu_name - Hardware decode available (NVDEC)"
+            info "   Benefit: 15-25% faster encoding (frees up CPU)"
+            decode_found=true
+        fi
+    fi
+    
+    # Check Intel
+    if lspci 2>/dev/null | grep -qi "intel.*vga\|intel.*display"; then
+        if [ -e /dev/dri/renderD128 ]; then
+            success "✅ Intel GPU: Hardware decode available (QSV)"
+            info "   Benefit: 15-25% faster encoding (frees up CPU)"
+            decode_found=true
+        fi
+    fi
+    
+    if [ "$decode_found" = false ]; then
+        warn "❌ No hardware decode support detected"
+        info "   CPU will handle decoding"
+    fi
+    
+    echo ""
+    info "💡 To enable hardware decode: --hw-decode"
+    echo ""
+}
+
+calculate_optimal_jobs() {
+    local resolution="$1"
+    local preset="${2:-$PRESET}"
+    local width
+    local height
+    
+    # Parse resolution
+    width=$(echo "$resolution" | cut -d'x' -f1)
+    height=$(echo "$resolution" | cut -d'x' -f2)
+    
+    # Default if parsing fails
+    if [ -z "$width" ] || [ -z "$height" ]; then
+        echo "4"
+        return
+    fi
+    
+    local pixels=$((width * height))
+    
+    # Calculate threads per job based on resolution
+    local threads_per_job=4
+    
+    if [ $pixels -ge 7680000 ]; then
+        # 4K+: needs more threads
+        threads_per_job=8
+    elif [ $pixels -ge 2073600 ]; then
+        # 1080p: moderate threads
+        threads_per_job=4
+    else
+        # 720p-: fewer threads
+        threads_per_job=2
+    fi
+    
+    # Adjust for preset (slower presets need more threads)
+    if [ "$preset" -le 3 ]; then
+        threads_per_job=$((threads_per_job + 2))
+    elif [ "$preset" -ge 8 ]; then
+        threads_per_job=$((threads_per_job - 1))
+        [ $threads_per_job -lt 1 ] && threads_per_job=1
+    fi
+    
+    # Calculate optimal jobs
+    local optimal=$((CPU_THREADS / threads_per_job))
+    
+    # Clamp to reasonable range
+    [ $optimal -lt 1 ] && optimal=1
+    [ $optimal -gt 16 ] && optimal=16
+    
+    echo "$optimal"
+}
+
+calculate_adaptive_crf() {
+    local file="$1"
+    local info
+    local width
+    local height
+    local bitrate
+    local codec
+
+    info=$(get_video_info "$file")
+    width=$(echo "$info" | cut -d'|' -f3)
+    height=$(echo "$info" | cut -d'|' -f4)
+    bitrate=$(echo "$info" | cut -d'|' -f2)
+    codec=$(echo "$info" | cut -d'|' -f1)
+    
+    # Validate dimensions
+    width=$(echo "$width" | awk '{printf "%d", $1}')
+    height=$(echo "$height" | awk '{printf "%d", $1}')
+    
+    if [ -z "$width" ] || [ "$width" -eq 0 ] || [ -z "$height" ] || [ "$height" -eq 0 ]; then
+        echo "30"
+        return
+    fi
+    
+    # Calculate base CRF from resolution
+    local pixels=$((width * height))
+    local base_crf=30
+    
+    if [ $pixels -ge 7680000 ]; then
+        # 4K+
+        base_crf=35
+    elif [ $pixels -ge 2073600 ]; then
+        # 1080p+
+        base_crf=32
+    elif [ $pixels -ge 921600 ]; then
+        # 720p+
+        base_crf=30
+    else
+        # SD
+        base_crf=28
+    fi
+    
+    # Adjust based on source quality/codec
+    case "$codec" in
+        h264|hevc)
+            # Analyze bitrate quality if available
+            if [ "$bitrate" != "N/A" ] && [ -n "$bitrate" ]; then
+                # Calculate quality ratio (Mbps per Megapixel)
+                local bitrate_mbps
+                local pixels_m
+                local quality_ratio
+                bitrate_mbps=$(awk -v b="$bitrate" 'BEGIN {printf "%.2f", b / 1000000}')
+                pixels_m=$(awk -v p="$pixels" 'BEGIN {printf "%.2f", p / 1000000}')
+                quality_ratio=$(awk -v bm="$bitrate_mbps" -v pm="$pixels_m" 'BEGIN {if (pm > 0) printf "%.3f", bm / pm; else print "0"}')
+                
+                # High quality source (>0.15 Mbps/Mpixel)
+                if (( $(awk -v qr="$quality_ratio" 'BEGIN {print (qr > 0.15)}') )); then
+                    base_crf=$((base_crf - 2))
+                # Low quality source (<0.08 Mbps/Mpixel)
+                elif (( $(awk -v qr="$quality_ratio" 'BEGIN {print (qr < 0.08 && qr > 0)}') )); then
+                    base_crf=$((base_crf + 2))
+                fi
+            fi
+            ;;
+        mpeg2video|mpeg1video)
+            # Old codecs, likely lower quality
+            base_crf=$((base_crf + 3))
+            ;;
+        vp8)
+            # VP8 typically lower quality
+            base_crf=$((base_crf + 2))
+            ;;
+        vp9)
+            # VP9 is efficient, don't increase too much
+            base_crf=$((base_crf + 1))
+            ;;
+    esac
+    
+    # Clamp to valid range
+    [ $base_crf -lt 0 ] && base_crf=0
+    [ $base_crf -gt 63 ] && base_crf=63
+    
+    echo "$base_crf"
+}
+
+#####################################################
+# PROGRESS TRACKING
+#####################################################
+show_progress() {
+    local file="$1"
+    local duration="$2"
+    local start_time="$3"
+    
+    local frame=0
+    local current_seconds=0
+    local fps=0
+    local out_time=""
+    
+    while IFS='=' read -r key value; do
+        case "$key" in
+            frame)
+                frame="$value"
+                ;;
+            out_time_us)
+                # Convert microseconds to seconds
+                current_seconds=$(awk -v us="$value" 'BEGIN {printf "%.2f", us / 1000000}')
+                ;;
+            out_time)
+                out_time="$value"
+                ;;
+            fps)
+                fps="$value"
+                ;;
+            progress)
+                # progress=continue or progress=end
+                if [ "$value" = "continue" ] || [ "$value" = "end" ]; then
+                    # Calculate progress percentage
+                    if (( $(echo "$duration > 0" | bc -l 2>/dev/null || echo 0) )); then
+                        local progress
+                        progress=$(awk -v curr="$current_seconds" -v dur="$duration" 'BEGIN {printf "%.1f", (curr / dur) * 100}')
+                        
+                        # Calculate ETA
+                        local eta="N/A"
+                        if (( $(echo "$fps > 0" | bc -l 2>/dev/null || echo 0) )); then
+                            local remaining
+                            remaining=$(awk -v dur="$duration" -v curr="$current_seconds" 'BEGIN {print dur - curr}')
+                            if (( $(echo "$remaining > 0" | bc -l 2>/dev/null || echo 0) )); then
+                                local eta_hours
+                                local eta_minutes
+                                local eta_seconds
+                                eta_hours=$(awk -v r="$remaining" 'BEGIN {printf "%d", r / 3600}')
+                                eta_minutes=$(awk -v r="$remaining" 'BEGIN {printf "%d", (r % 3600) / 60}')
+                                eta_seconds=$(awk -v r="$remaining" 'BEGIN {printf "%d", r % 60}')
+                                eta=$(printf "%02d:%02d:%02d" "$eta_hours" "$eta_minutes" "$eta_seconds")
+                            fi
+                        fi
+                        
+                        # Draw progress bar
+                        local bar_length=40
+                        local progress_int
+                        local filled
+
+                        progress_int=$(awk -v p="$progress" 'BEGIN {printf "%d", p}')
+                        filled=$(awk -v p="$progress_int" -v l="$bar_length" 'BEGIN {printf "%d", (p * l) / 100}')
+                        
+                        # Validate
+                        if [ -z "$filled" ] || [ "$filled" -lt 0 ]; then
+                            filled=0
+                        fi
+                        if [ "$filled" -gt "$bar_length" ]; then
+                            filled=$bar_length
+                        fi
+                        
+                        local empty=$((bar_length - filled))
+                        
+                        # Build bar
+                        local bar=""
+                        local i
+                        for ((i=0; i<filled; i++)); do bar+="█"; done
+                        for ((i=0; i<empty; i++)); do bar+="░"; done
+                        
+                        # Clean fps for display (handle locale)
+                        local fps_display
+                        fps_display=$(echo "$fps" | tr ',' '.')
+                        
+                        # Display
+                        printf "\r${C_CYAN}[%s] %s%% | %s fps | ETA: %s${C_RESET}" "$bar" "$progress" "$fps_display" "$eta"
+                    fi
+                fi
+                ;;
+        esac
+    done
+    echo ""
+}
+
+#####################################################
+# INTERACTIVE MODE
+#####################################################
+interactive_mode() {
+    need fzf
+    
+    log "🎮 Interactive Mode" >&2
+    echo "" >&2
+    
+    # Step 1: Ask for folder path
+    log "📂 Folder Selection" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    info "Enter the folder path containing MKV files" >&2
+    if [[ "$RECURSIVE" == true ]]; then
+        info "Recursive mode: Will include subdirectories" >&2
+    else
+        info "Non-recursive mode: Only files in target folder" >&2
+        info "Tip: Use --recursive flag to include subdirectories" >&2
+    fi
+    info "Press ENTER to use current directory: $TARGET_FOLDER" >&2
+    echo "" >&2
+    
+    read -rp "$(echo -e "${C_CYAN}Folder path [default: ${C_BOLD}$TARGET_FOLDER${C_RESET}${C_CYAN}]:${C_RESET} ")" user_folder
+    if [ -n "$user_folder" ]; then
+        # Expand ~ to home directory
+        user_folder="${user_folder/#\~/$HOME}"
+        if [ ! -d "$user_folder" ]; then
+            warn "⚠️  Directory not found: $user_folder" >&2
+            warn "⚠️  Using default: $TARGET_FOLDER" >&2
+        else
+            TARGET_FOLDER="$user_folder"
+            info "   Using: $TARGET_FOLDER" >&2
+        fi
+    else
+        info "   Using: $TARGET_FOLDER" >&2
+    fi
+    echo "" >&2
+    
+    # Find all MKV files
+    local all_files
+    local total_found
+
+    if [[ "$RECURSIVE" == true ]]; then
+        all_files=$(find "$TARGET_FOLDER" -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    else
+        all_files=$(find "$TARGET_FOLDER" -maxdepth 1 -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    fi
+    
+    if [ -z "$all_files" ]; then
+        err "❌ No MKV files found in '$TARGET_FOLDER'"
+    fi
+    
+    total_found=$(echo "$all_files" | wc -l)
+    info "📊 Found $total_found MKV file(s) in folder" >&2
+    echo "" >&2
+    
+    # Step 2: Analyze codecs present
+    log "🔍 Analyzing codecs..." >&2
+    declare -A codec_files
+    declare -A codec_counts
+    declare -A codec_sizes
+    
+    while IFS= read -r file; do
+        local codec
+        local size
+        codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+        size=$($STAT_CMD "$file")
+        if [ -n "$codec" ]; then
+            codec_files["$codec"]+="$file"$'\n'
+            codec_counts["$codec"]=$((${codec_counts["$codec"]:-0} + 1))
+            codec_sizes["$codec"]=$((${codec_sizes["$codec"]:-0} + size))
+        fi
+    done <<< "$all_files"
+    
+    echo "" >&2
+    log "📋 Codecs Found:" >&2
+    for codec in $(echo "${!codec_counts[@]}" | tr ' ' '\n' | sort); do
+        local codec_name
+        local count
+        local size
+        codec_name=$(get_codec_friendly_name "$codec")
+        count=${codec_counts[$codec]}
+        size=${codec_sizes[$codec]}
+        info "   • $codec_name: $count file(s), $(numfmt --to=iec "$size")" >&2
+    done
+    echo "" >&2
+    
+    # Step 3: Ask which codecs to skip
+    log "🎯 Codec Skip Selection" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    info "Select codecs to SKIP (will not be converted)" >&2
+    info "Use TAB to select, ENTER to confirm, ESC to skip none" >&2
+    info "💡 Recommended: Skip AV1 (already optimal), consider HEVC/VP9 (already efficient)" >&2
+    echo "" >&2
+    
+    # Create codec list for fzf
+    local codec_list=""
+    for codec in $(echo "${!codec_counts[@]}" | tr ' ' '\n' | sort); do
+        local codec_name
+        local count
+        local size
+        local size_str
+
+        codec_name=$(get_codec_friendly_name "$codec")
+        count=${codec_counts[$codec]}
+        size=${codec_sizes[$codec]}
+        size_str=$(numfmt --to=iec "$size")
+        
+        # Add recommendation hints
+        local hint=""
+        case "$codec" in
+            av1)
+                hint=" [⚠️  Already optimal - SKIP recommended]"
+                ;;
+            hevc|h265)
+                hint=" [Already efficient - consider skipping]"
+                ;;
+            vp9)
+                hint=" [Already efficient - consider skipping]"
+                ;;
+            mpeg1|mpeg2|vc1|theora)
+                hint=" [⭐ Excellent candidate for AV1]"
+                ;;
+        esac
+        
+        codec_list+="$codec|$codec_name: $count file(s), $size_str$hint"$'\n'
+    done
+    
+    # Use fzf for multi-select
+    local skipped_codecs
+    skipped_codecs=$(echo -n "$codec_list" | fzf --multi \
+        --header="Select codecs to SKIP (TAB: select, ENTER: confirm, ESC: skip none)" \
+        --prompt="Skip ❯ " \
+        --pointer="▶" \
+        --marker="✗" \
+        --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
+        --no-preview \
+        | cut -d'|' -f1)
+    
+    # Build selected files list (excluding skipped codecs)
+    local selected=""
+    local skipped_count=0
+    
+    echo "" >&2
+    if [ -n "$skipped_codecs" ]; then
+        log "⏭️  Skipping codecs:" >&2
+        while IFS= read -r codec; do
+            local codec_name
+            local count
+            codec_name=$(get_codec_friendly_name "$codec")
+            count=${codec_counts[$codec]}
+            skipped_count=$((skipped_count + count))
+            info "   ✗ $codec_name ($count file(s))" >&2
+        done <<< "$skipped_codecs"
+        echo "" >&2
+    fi
+    
+    for codec in "${!codec_files[@]}"; do
+        if ! echo "$skipped_codecs" | grep -q "^$codec$"; then
+            selected+="${codec_files[$codec]}"
+        fi
+    done
+    
+    # Remove trailing newline and empty lines
+    selected=$(echo "$selected" | grep -v "^$")
+    
+    if [ -z "$selected" ]; then
+        warn "⚠️  No files to process (all codecs skipped). Exiting." >&2
+        exit 0
+    fi
+    
+    # Show summary
+    local count
+    count=$(echo "$selected" | wc -l)
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    log "📦 Files Selected for Compression" >&2
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    info "Total files in folder: $total_found" >&2
+    info "Files to process: $count" >&2
+    if [ "$skipped_count" -gt 0 ]; then
+        info "Files skipped: $skipped_count" >&2
+    fi
+    echo "" >&2
+    
+    # Show breakdown by codec (only files being processed)
+    declare -A processing_codec_counts
+    declare -A processing_codec_sizes
+    while IFS= read -r file; do
+        local codec
+        local size
+        codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+        size=$($STAT_CMD "$file")
+        processing_codec_counts["$codec"]=$((${processing_codec_counts["$codec"]:-0} + 1))
+        processing_codec_sizes["$codec"]=$((${processing_codec_sizes["$codec"]:-0} + size))
+    done <<< "$selected"
+    
+    info "Processing by codec:" >&2
+    local total_size=0
+    for codec in $(echo "${!processing_codec_counts[@]}" | tr ' ' '\n' | sort); do
+        local codec_name
+        codec_name=$(get_codec_friendly_name "$codec")
+        local count=${processing_codec_counts[$codec]}
+        local size=${processing_codec_sizes[$codec]}
+        total_size=$((total_size + size))
+        info "   • $codec_name: $count file(s), $(numfmt --to=iec "$size")" >&2
+    done
+    echo "" >&2
+    info "Total size to process: $(numfmt --to=iec $total_size)" >&2
+    echo "" >&2
+
+    # Interactive parameter configuration
+    echo "" >&2
+    log "⚙️  Configure Encoding Settings" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    
+    # 1. Encoder selection
+    info "Available encoders in your FFmpeg:" >&2
+    local available_encoders
+    available_encoders=$(ffmpeg -hide_banner -encoders 2>&1 | grep -E "(libsvtav1|libaom-av1|librav1e|av1_nvenc|av1_qsv|av1_amf)" | awk '{print "   • " $2}')
+    if [ -n "$available_encoders" ]; then
+        echo "$available_encoders" >&2
+    else
+        echo "   • libsvtav1 (or will auto-detect)" >&2
+    fi
+    echo "" >&2
+    
+    read -p "$(echo -e "${C_CYAN}Encoder [${C_BOLD}libsvtav1${C_RESET}${C_CYAN}/libaom-av1/librav1e/av1_nvenc] (press Enter for auto-detect):${C_RESET} ")" user_encoder
+    if [ -n "$user_encoder" ]; then
+        ENCODER="$user_encoder"
+        info "   Using: $ENCODER" >&2
+    else
+        if [ -z "$ENCODER" ]; then
+            ENCODER=$(detect_av1_encoder)
+        fi
+        info "   Auto-detected: $ENCODER" >&2
+    fi
+    echo "" >&2
+    
+    # 2. Preset selection
+    case "$ENCODER" in
+        libsvtav1)
+            info "SVT-AV1 Preset: 0-13 (0=slowest/best, 6=balanced, 13=fastest)" >&2
+            ;;
+        libaom-av1)
+            info "libaom-av1 Preset: 0-8 (0=slowest/best, 6=balanced, 8=fastest)" >&2
+            ;;
+        librav1e)
+            info "rav1e Preset: 0-10 (0=slowest/best, 6=balanced, 10=fastest)" >&2
+            ;;
+        av1_nvenc|av1_qsv|av1_amf|av1_vaapi)
+            info "Hardware encoder - preset may not apply" >&2
+            ;;
+        *)
+            info "Preset: 0-13 (lower=slower/better, higher=faster)" >&2
+            ;;
+    esac
+    read -p "$(echo -e "${C_CYAN}Preset [default: ${C_BOLD}6${C_RESET}${C_CYAN}] (press Enter for default):${C_RESET} ")" user_preset
+    if [ -n "$user_preset" ]; then
+        PRESET="$user_preset"
+        info "   Using preset: $PRESET" >&2
+    else
+        info "   Using default preset: $PRESET" >&2
+    fi
+    echo "" >&2
+    
+    # 3. CRF selection
+    info "CRF (Constant Rate Factor): 0-63" >&2
+    info "   • Lower = Better quality, larger files (recommended: 20-28)" >&2
+    info "   • Higher = Lower quality, smaller files (recommended: 32-40)" >&2
+    info "   • Auto-detect analyzes source and sets optimal value" >&2
+    read -p "$(echo -e "${C_CYAN}CRF [default: ${C_BOLD}auto-detect${C_RESET}${C_CYAN}] (press Enter for auto):${C_RESET} ")" user_crf
+    if [ -n "$user_crf" ]; then
+        CRF="$user_crf"
+        AUTO_CRF=false
+        if (( CRF < 0 || CRF > 63 )); then
+            warn "⚠️  CRF out of range (0-63), using auto-detect" >&2
+            CRF=""
+            AUTO_CRF=true
+        else
+            info "   Using CRF: $CRF" >&2
+        fi
+    else
+        AUTO_CRF=true
+        info "   Using auto-detect (analyzes each file)" >&2
+    fi
+    echo "" >&2
+    
+    # 4. Jobs selection
+    info "Parallel Jobs: 1-$CPU_THREADS available CPU threads" >&2
+    info "   • 1 = Sequential processing (one file at a time, shows progress)" >&2
+    info "   • 2-$CPU_THREADS = Parallel processing (multiple files simultaneously)" >&2
+    info "   • Recommended: 1 for seeing progress, 4-6 for speed" >&2
+    read -p "$(echo -e "${C_CYAN}Jobs [default: ${C_BOLD}$JOBS${C_RESET}${C_CYAN}] (press Enter for default):${C_RESET} ")" user_jobs
+    if [ -n "$user_jobs" ]; then
+        if (( user_jobs < 1 || user_jobs > CPU_THREADS )); then
+            warn "⚠️  Jobs out of range (1-$CPU_THREADS), using default: $JOBS" >&2
+        else
+            JOBS="$user_jobs"
+            if [ "$JOBS" -eq 1 ]; then
+                info "   Using sequential processing (1 job)" >&2
+            else
+                info "   Using parallel processing ($JOBS jobs)" >&2
+            fi
+        fi
+    else
+        if [ "$JOBS" -eq 1 ]; then
+            info "   Using sequential processing (1 job)" >&2
+        else
+            info "   Using parallel processing ($JOBS jobs)" >&2
+        fi
+    fi
+    echo "" >&2
+    
+    # 5. Force 10-bit option
+    info "Force 10-bit encoding?" >&2
+    info "   • Improves quality for gradients and smooth areas" >&2
+    info "   • Slightly better compression" >&2
+    info "   • May have compatibility issues with older devices" >&2
+    read -p "$(echo -e "${C_CYAN}Force 10-bit? [y/N] (press Enter for no):${C_RESET} ")" -n 1 -r user_10bit
+    echo "" >&2
+    if [[ $user_10bit =~ ^[Yy]$ ]]; then
+        FORCE_10BIT=true
+        info "   ✓ Will encode in 10-bit" >&2
+    else
+        FORCE_10BIT=false
+        info "   ✗ Will auto-detect bit depth" >&2
+    fi
+    echo "" >&2
+    
+    # 6. Hardware decode option
+    info "Enable hardware video decoding?" >&2
+    info "   • 15-25% faster encoding (frees up CPU)" >&2
+    info "   • Requires compatible GPU (AMD/NVIDIA/Intel)" >&2
+    read -p "$(echo -e "${C_CYAN}Hardware decode? [y/N] (press Enter for no):${C_RESET} ")" -n 1 -r user_hwdec
+    echo "" >&2
+    if [[ $user_hwdec =~ ^[Yy]$ ]]; then
+        HW_DECODE=true
+        info "   ✓ Hardware decode enabled (auto-detect)" >&2
+    else
+        HW_DECODE=false
+        info "   ✗ Software decode" >&2
+    fi
+    echo "" >&2
+    
+    # 7. Film grain mode option
+    info "Optimize for film grain retention?" >&2
+    info "   • Better for old films and grainy content" >&2
+    info "   • Uses tune=4 parameter" >&2
+    read -p "$(echo -e "${C_CYAN}Film grain mode? [y/N] (press Enter for no):${C_RESET} ")" -n 1 -r user_grain
+    echo "" >&2
+    if [[ $user_grain =~ ^[Yy]$ ]]; then
+        TUNE_GRAIN=true
+        info "   ✓ Film grain optimization enabled" >&2
+    else
+        TUNE_GRAIN=false
+        info "   ✗ Standard encoding" >&2
+    fi
+    echo "" >&2
+    
+    # 8. Notification option
+    info "Send desktop notification when complete?" >&2
+    info "   • Useful for long batches" >&2
+    read -p "$(echo -e "${C_CYAN}Enable notifications? [y/N] (press Enter for no):${C_RESET} ")" -n 1 -r user_notify
+    echo "" >&2
+    if [[ $user_notify =~ ^[Yy]$ ]]; then
+        SEND_NOTIFICATIONS=true
+        info "   ✓ Will send notification" >&2
+    else
+        SEND_NOTIFICATIONS=false
+        info "   ✗ No notification" >&2
+    fi
+    echo "" >&2
+    
+    # Summary and confirmation
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    log "📊 Final Configuration Summary" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    info "   Folder: $TARGET_FOLDER" >&2
+    if [[ "$RECURSIVE" == true ]]; then
+        info "   Mode: Recursive (includes subdirectories)" >&2
+    fi
+    info "   Files to process: $count" >&2
+    if [ "$skipped_count" -gt 0 ]; then
+        info "   Files skipped: $skipped_count" >&2
+    fi
+    info "   Encoder: $ENCODER" >&2
+    info "   Preset: $PRESET" >&2
+    info "   CRF: ${CRF:-auto-detect per file}" >&2
+    if [[ "$FORCE_10BIT" == true ]]; then
+        info "   Bit depth: 10-bit (forced)" >&2
+    fi
+    if [[ "$HW_DECODE" == true ]]; then
+        info "   Hardware decode: Enabled" >&2
+    fi
+    if [[ "$TUNE_GRAIN" == true ]]; then
+        info "   Film grain mode: Enabled" >&2
+    fi
+    info "   Parallel Jobs: $JOBS" >&2
+    if [[ "$SEND_NOTIFICATIONS" == true ]]; then
+        info "   Notification: Enabled" >&2
+    fi
+    echo "" >&2
+    
+    read -p "$(echo -e "${C_GREEN}${C_BOLD}Proceed with compression? [Y/n]${C_RESET} ")" -n 1 -r
+    echo "" >&2
+    echo "" >&2
+    if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ -n $REPLY ]]; then
+        warn "⚠️  Cancelled by user" >&2
+        exit 0
+    fi
+    
+    # Save configuration to file in target directory so parent shell can read it
+    # (interactive_mode runs in a subshell, so variable changes don't persist)
+    local config_file="${CONFIG_FILE:-}"
+    [[ -z "$config_file" ]] && config_file="/tmp/shrink_mkv_config_$$"
+    cat > "$config_file" << EOF
+ENCODER=$ENCODER
+PRESET=$PRESET
+CRF=$CRF
+AUTO_CRF=$AUTO_CRF
+JOBS=$JOBS
+TARGET_FOLDER=$TARGET_FOLDER
+FORCE_10BIT=$FORCE_10BIT
+HW_DECODE=$HW_DECODE
+TUNE_GRAIN=$TUNE_GRAIN
+SEND_NOTIFICATIONS=$SEND_NOTIFICATIONS
+EOF
+    
+    # Return selected files (ONLY output to stdout, everything else went to stderr)
+    echo "$selected"
+}
+
+#####################################################
+# List Codecs in Directory
+#####################################################
+list_codecs() {
+    log "🔍 Scanning MKV files in: $TARGET_FOLDER"
+    echo ""
+    
+    local files
+    if [[ "$RECURSIVE" == true ]]; then
+        files=$(find "$TARGET_FOLDER" -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    else
+        files=$(find "$TARGET_FOLDER" -maxdepth 1 -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    fi
+    
+    if [ -z "$files" ]; then
+        warn "⚠️  No MKV files found in '$TARGET_FOLDER'"
+        exit 0
+    fi
+    
+    declare -A codec_counts
+    declare -A codec_sizes
+    declare -A codec_files
+    local total_files=0
+    local total_size=0
+    
+    echo -e "${C_CYAN}Analyzing files...${C_RESET}"
+    
+    while IFS= read -r file; do
+        local info
+        local codec
+        local codec_name
+        local size
+        info=$(get_video_info "$file")
+        codec=$(echo "$info" | cut -d'|' -f1)
+        codec_name=$(get_codec_friendly_name "$codec")
+        size=$($STAT_CMD "$file")
+        
+        codec_counts["$codec_name"]=$((${codec_counts["$codec_name"]:-0} + 1))
+        codec_sizes["$codec_name"]=$((${codec_sizes["$codec_name"]:-0} + size))
+        
+        if [ -z "${codec_files["$codec_name"]}" ]; then
+            codec_files["$codec_name"]="$(basename "$file")"
+        fi
+        
+        total_files=$((total_files + 1))
+        total_size=$((total_size + size))
+    done <<< "$files"
+    
+    echo ""
+    log "╔════════════════════════════════════════════════════════════╗"
+    log "║                   CODEC SUMMARY                            ║"
+    log "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    printf "${C_BOLD}%-20s %8s %12s %10s${C_RESET}\n" "CODEC" "FILES" "TOTAL SIZE" "AVG SIZE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    for codec_name in "${!codec_counts[@]}"; do
+        local count=${codec_counts["$codec_name"]}
+        local size=${codec_sizes["$codec_name"]}
+        local avg=$((size / count))
+        
+        printf "${C_GREEN}%-20s${C_RESET} %8d %12s %10s\n" \
+            "$codec_name" \
+            "$count" \
+            "$(numfmt --to=iec "$size")" \
+            "$(numfmt --to=iec $avg)"
+    done | sort -k2 -rn
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf "${C_BOLD}%-20s %8d %12s${C_RESET}\n" \
+        "TOTAL" \
+        "$total_files" \
+        "$(numfmt --to=iec $total_size)"
+    
+    echo ""
+    log "📊 Codec Details:"
+    for codec_name in "${!codec_counts[@]}"; do
+        echo "   • $codec_name: Example file: ${codec_files["$codec_name"]}"
+    done
+    
+    echo ""
+    info "💡 Recommendations:"
+    
+    # Check for AV1 files
+    if [ "${codec_counts["AV1"]:-0}" -gt 0 ]; then
+        success "   ✓ ${codec_counts["AV1"]} file(s) already in AV1 format"
+    fi
+    
+    # Check for already efficient codecs
+    local efficient_count=0
+    for codec in "H.265/HEVC" "VP9"; do
+        efficient_count=$((efficient_count + ${codec_counts["$codec"]:-0}))
+    done
+    
+    if [ $efficient_count -gt 0 ]; then
+        warn "   ⚠️  $efficient_count file(s) in efficient codecs (HEVC/VP9)"
+        warn "      Consider using: --skip-codec hevc --skip-codec vp9"
+    fi
+    
+    # Check for old codecs
+    local old_count=0
+    for codec in "MPEG-1" "MPEG-2" "VC-1" "Theora"; do
+        old_count=$((old_count + ${codec_counts["$codec"]:-0}))
+    done
+    
+    if [ $old_count -gt 0 ]; then
+        success "   ✓ $old_count file(s) in older codecs - excellent AV1 candidates!"
+    fi
+    
+    echo ""
+}
+
+#####################################################
+# Show Summary on Interruption
+#####################################################
+show_interrupted_summary() {
+    # Only show if we have processed at least one file
+    if [ ! -f "$PROGRESS_FILE" ] || [ ! -s "$PROGRESS_FILE" ]; then
+        return
+    fi
+    
+    local total_original=0
+    local total_compressed=0
+    local total_time=0
+    local count=0
+    
+    while IFS='|' read -r file old_size new_size time; do
+        total_original=$((total_original + old_size))
+        total_compressed=$((total_compressed + new_size))
+        total_time=$((total_time + time))
+        count=$((count + 1))
+    done < "$PROGRESS_FILE"
+    
+    # Only show if at least one file was processed
+    if [ $count -eq 0 ]; then
+        return
+    fi
+    
+    local total_saved=$((total_original - total_compressed))
+    local avg_percent
+    local time_str
+    avg_percent=$(echo "scale=1; ($total_saved * 100) / $total_original" | bc -l)
+    time_str=$(printf "%02d:%02d:%02d" $((total_time/3600)) $((total_time%3600/60)) $((total_time%60)))
+    
+    echo ""
+    echo -e "${C_YELLOW}╔════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_YELLOW}║              INTERRUPTED - PARTIAL SUMMARY                 ║${C_RESET}"
+    echo -e "${C_YELLOW}╚════════════════════════════════════════════════════════════╝${C_RESET}"
+    success "✅ Completed before interruption: $count file(s)"
+    success "📊 Total original size:    $(numfmt --to=iec $total_original)"
+    success "📊 Total compressed size:  $(numfmt --to=iec $total_compressed)"
+    success "💾 Total space saved:      $(numfmt --to=iec $total_saved) (${avg_percent}%)"
+    success "⏱️  Total processing time:  $time_str"
+    echo ""
+    info "💡 Progress saved! You can continue with remaining files by running the script again."
+}
+
+#####################################################
+# Cleanup on SIGINT (Ctrl+C), SIGTERM, EXIT
+#####################################################
+CLEANUP_DONE=false
+INTERRUPTED=false
+
+cleanup() {
+    # Prevent duplicate cleanup
+    if [ "$CLEANUP_DONE" = true ]; then
+        return 0
+    fi
+    CLEANUP_DONE=true
+    
+    local exit_code=$?
+    
+    # Clean up temporary encoding file(s)
+    # Check both TEMP_OUTPUT variable and search for pattern
+    local found_temp=false
+    
+    if [ -n "$TEMP_OUTPUT" ] && [ -f "$TEMP_OUTPUT" ]; then
+        echo -e "\n${C_RED}🚨 Interrupted! Cleaning up temporary files...${C_RESET}" >&2
+        rm -f "$TEMP_OUTPUT"
+        found_temp=true
+    fi
+    
+    # Also search for any *_temp.mkv files in target folder
+    if [ -n "$TARGET_FOLDER" ] && [ -d "$TARGET_FOLDER" ]; then
+        local temp_files
+        temp_files=$(find "$TARGET_FOLDER" -maxdepth 1 -name "*_temp.mkv" 2>/dev/null)
+        if [ -n "$temp_files" ]; then
+            if [ "$found_temp" = false ]; then
+                echo -e "\n${C_RED}🚨 Interrupted! Cleaning up temporary files...${C_RESET}" >&2
+            fi
+            echo "$temp_files" | while read -r temp_file; do
+                echo "   Removing: $(basename "$temp_file")" >&2
+                rm -f "$temp_file"
+            done
+            found_temp=true
+        fi
+    fi
+    
+    # Clean up progress tracking file
+    if [ -n "$PROGRESS_FILE" ] && [ -f "$PROGRESS_FILE" ]; then
+        # Show summary if interrupted and at least one file was processed
+        if [ "$INTERRUPTED" = true ]; then
+            show_interrupted_summary
+        fi
+        rm -f "$PROGRESS_FILE"
+    fi
+    
+    # Clean up interactive mode config file
+    if [ -n "${CONFIG_FILE:-}" ]; then
+        rm -f "$CONFIG_FILE"
+    fi
+    
+    # Kill all background jobs and their child processes (ffmpeg)
+    local bg_jobs
+    bg_jobs=$(jobs -p)
+    if [ -n "$bg_jobs" ]; then
+        echo -e "${C_YELLOW}Terminating background jobs...${C_RESET}" >&2
+        
+        # Kill entire process groups (includes ffmpeg children)
+        for job_pid in $bg_jobs; do
+            # Kill the process and all its children
+            pkill -TERM -P "$job_pid" 2>/dev/null
+            kill -TERM "$job_pid" 2>/dev/null
+        done
+        
+        # Give them time to die gracefully
+        sleep 2
+        
+        # Force kill any survivors
+        for job_pid in $bg_jobs; do
+            pkill -KILL -P "$job_pid" 2>/dev/null
+            kill -KILL "$job_pid" 2>/dev/null
+        done
+        
+        # Also kill any ffmpeg processes that might be orphaned
+        pkill -KILL -f "ffmpeg.*$TARGET_FOLDER.*_temp.mkv" 2>/dev/null
+    fi
+    
+    # Always exit after cleanup (don't continue processing)
+    # If exit_code is 0 (from Ctrl+C), use 130 (standard SIGINT code)
+    if [ "$exit_code" -eq 0 ]; then
+        exit 130
+    else
+        exit "$exit_code"
+    fi
+}
+
+# Handler for interruption signals (Ctrl+C, kill)
+handle_interrupt() {
+    INTERRUPTED=true
+    cleanup
+}
+
+# Set up traps for various signals and exit conditions
+trap handle_interrupt SIGINT SIGTERM
+trap cleanup EXIT ERR
+
+#####################################################
+# Process Single File
+#####################################################
+process_file() {
+    local INPUT="$1"
+    local BASENAME="${INPUT%.*}"
+    TEMP_OUTPUT="${BASENAME}_temp.mkv"  # Make this global so cleanup can access it
+    local start_time
+    start_time=$(date +%s)
+    
+    # Get video info
+    local info
+    local codec
+    local codec_name
+    local duration
+    local width
+    local height
+    local pix_fmt
+
+    info=$(get_video_info "$INPUT")
+    codec=$(echo "$info" | cut -d'|' -f1)
+    codec_name=$(get_codec_friendly_name "$codec")
+    duration=$(echo "$info" | cut -d'|' -f6)
+    width=$(echo "$info" | cut -d'|' -f3)
+    height=$(echo "$info" | cut -d'|' -f4)
+    pix_fmt=$(echo "$info" | cut -d'|' -f7)
+    
+    # Check disk space if enabled
+    if ! check_disk_space "$INPUT"; then
+        return 1
+    fi
+    
+    # Detect and preserve 10-bit if present, or force 10-bit if requested
+    local target_pix_fmt="yuv420p"
+    local bit_depth="8-bit"
+    if [[ "$FORCE_10BIT" == true ]]; then
+        target_pix_fmt="yuv420p10le"
+        bit_depth="10-bit"
+    elif [[ "$pix_fmt" =~ (10|12)le$ ]]; then
+        target_pix_fmt="yuv420p10le"
+        bit_depth="10-bit"
+    fi
+    
+    # Determine CRF
+    local use_crf="$CRF"
+    if [[ -z "$use_crf" ]] || [[ "$AUTO_CRF" == true ]]; then
+        use_crf=$(calculate_adaptive_crf "$INPUT")
+        [[ "$QUIET" == false ]] && info "   📊 Auto-detected CRF: $use_crf (${width}x${height}, $bit_depth, codec: $codec_name)"
+    fi
+    
+    # Detect hardware encoder if enabled
+    local hw_encoder=""
+    local using_hw=false
+    if [[ "$USE_HARDWARE" == true ]]; then
+        if [ -n "$HW_ENCODER" ]; then
+            hw_encoder="$HW_ENCODER"
+        else
+            hw_encoder=$(detect_hardware_av1_encoder)
+        fi
+        
+        if [ -n "$hw_encoder" ]; then
+            using_hw=true
+            [[ "$QUIET" == false ]] && info "   ⚡ Using hardware encoder: $hw_encoder"
+        fi
+    fi
+    
+    # Setup hardware decode if enabled
+    local hw_decode_opts=""
+    if [[ "$HW_DECODE" == true ]]; then
+        if [ -n "$HW_DECODE_DEVICE" ]; then
+            # User specified device
+            case "$HW_DECODE_DEVICE" in
+                vaapi)
+                    hw_decode_opts="-hwaccel vaapi -hwaccel_device /dev/dri/renderD128"
+                    [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: VAAPI"
+                    ;;
+                cuda)
+                    hw_decode_opts="-hwaccel cuda"
+                    [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: CUDA (NVDEC)"
+                    ;;
+                qsv)
+                    hw_decode_opts="-hwaccel qsv"
+                    [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: QSV"
+                    ;;
+            esac
+        else
+            # Auto-detect
+            if detect_hardware_decode; then
+                case "$hw_decode_device" in
+                    vaapi)
+                        hw_decode_opts="-hwaccel vaapi -hwaccel_device /dev/dri/renderD128"
+                        [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: VAAPI (AMD/Intel)"
+                        ;;
+                    cuda)
+                        hw_decode_opts="-hwaccel cuda"
+                        [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: CUDA (NVDEC)"
+                        ;;
+                    qsv)
+                        hw_decode_opts="-hwaccel qsv"
+                        [[ "$QUIET" == false ]] && info "   ⚡ Using hardware decode: QSV (Intel)"
+                        ;;
+                esac
+            fi
+        fi
+    fi
+    
+    log "▶️  Compressing: $(basename "$INPUT")"
+    if [ "$using_hw" = true ]; then
+        [[ "$QUIET" == false ]] && info "   🎬 Source: $codec_name → AV1 (HW: $hw_encoder) | CRF: $use_crf | $bit_depth"
+    else
+        [[ "$QUIET" == false ]] && info "   🎬 Source: $codec_name → AV1 | CRF: $use_crf | Preset: $PRESET | $bit_depth"
+    fi
+    
+    # Dry-run mode: show what would be done without encoding
+    if [[ "$DRY_RUN" == true ]]; then
+        info "   [DRY RUN] Would encode with:"
+        if [ "$using_hw" = true ]; then
+            info "     Encoder: $hw_encoder (Hardware)"
+        else
+            info "     Encoder: $ENCODER (CPU)"
+        fi
+        info "     CRF: $use_crf"
+        info "     Preset: $PRESET"
+        info "     Resolution: ${width}x${height}"
+        info "     Bit depth: $bit_depth"
+        return 0
+    fi
+    
+    # Calculate keyframe interval based on FPS
+    local fps
+    fps=$(echo "$info" | cut -d'|' -f5)
+    local keyint=300
+    if [ -n "$fps" ] && [ "$fps" != "0" ]; then
+        keyint=$(awk -v f="$fps" 'BEGIN {printf "%.0f", f * 10}')
+    fi
+    
+    local encoder_opts=""
+    # hw_decode_opts already set above when HW_DECODE is true; do not reset here
+
+    if [ "$using_hw" = true ]; then
+        case "$hw_encoder" in
+            av1_nvenc)
+                encoder_opts="-c:v av1_nvenc -preset p5 -rc constqp -qp $use_crf -multipass 2"
+                # Only set decode opts if not already set (for encode+decode combo)
+                if [ -z "$hw_decode_opts" ]; then
+                    hw_decode_opts="-hwaccel cuda -hwaccel_output_format cuda"
+                else
+                    # Combine with output format for NVENC
+                    hw_decode_opts="$hw_decode_opts -hwaccel_output_format cuda"
+                fi
+                ;;
+            av1_qsv)
+                encoder_opts="-c:v av1_qsv -preset medium -global_quality $use_crf"
+                if [ -z "$hw_decode_opts" ]; then
+                    hw_decode_opts="-hwaccel qsv -hwaccel_output_format qsv"
+                else
+                    hw_decode_opts="$hw_decode_opts -hwaccel_output_format qsv"
+                fi
+                ;;
+            av1_vaapi)
+                encoder_opts="-vaapi_device /dev/dri/renderD128 -c:v av1_vaapi -qp $use_crf"
+                ;;
+        esac
+    else
+        case "$ENCODER" in
+            libsvtav1)
+                encoder_opts="-preset $PRESET -crf $use_crf -g $keyint"
+                
+                local svt_params="tune=0:film-grain=0:enable-overlays=1:scd=1:scm=0:irefresh-type=2"
+                
+                if [[ "$ENABLE_VARBOOST" == true ]]; then
+                    svt_params="$svt_params:enable-variance-boost=1:variance-boost-strength=2:variance-octile=6"
+                fi
+                
+                if [[ "$TUNE_GRAIN" == true ]]; then
+                    svt_params="tune=4:film-grain=0:enable-overlays=1:scd=1:scm=0:irefresh-type=2"
+                    svt_params="$svt_params:enable-tf=0:enable-restoration=0:enable-cdef=0"
+                fi
+                
+                encoder_opts="$encoder_opts -svtav1-params $svt_params"
+                ;;
+            libaom-av1)
+                encoder_opts="-cpu-used $PRESET -crf $use_crf -g $keyint"
+                encoder_opts="$encoder_opts -row-mt 1 -tiles 2x1"
+                ;;
+            librav1e)
+                encoder_opts="-speed $PRESET -qp $use_crf"
+                encoder_opts="$encoder_opts -tiles 4"
+                ;;
+        esac
+    fi
+    
+    # Capture ffmpeg stderr on failure (sequential mode) so we can show the error
+    FFMPEG_ERR=""
+    [[ "$QUIET" == false ]] && [[ "$JOBS" -eq 1 ]] && FFMPEG_ERR=$(mktemp -t shrink_mkv_err.XXXXXX 2>/dev/null) || true
+    [[ -z "$FFMPEG_ERR" ]] && [[ "$QUIET" == false ]] && [[ "$JOBS" -eq 1 ]] && FFMPEG_ERR=$(dirname "$INPUT")/.shrink_mkv_ffmpeg_err_$$ || true
+
+    if [[ "$QUIET" == true ]] || [[ "$JOBS" -gt 1 ]]; then
+        if [ "$using_hw" = true ] && [ "$hw_encoder" = "av1_vaapi" ]; then
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                -vf "format=nv12,hwupload" \
+                $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
+        elif [ "$using_hw" = true ]; then
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
+        else
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                -pix_fmt "$target_pix_fmt" \
+                -c:v "$ENCODER" $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
+        fi
+        local exit_code=$?
+    else
+        if [ "$using_hw" = true ] && [ "$hw_encoder" = "av1_vaapi" ]; then
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                -vf "format=nv12,hwupload" \
+                $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
+        elif [ "$using_hw" = true ]; then
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
+        else
+            ffmpeg $hw_decode_opts -i "$INPUT" \
+                -pix_fmt "$target_pix_fmt" \
+                -c:v "$ENCODER" $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
+        fi
+        local exit_code=${PIPESTATUS[0]}
+    fi
+    
+    if [ $exit_code -eq 0 ] && [ -f "$TEMP_OUTPUT" ]; then
+
+        local OLD_SIZE
+        OLD_SIZE=$($STAT_CMD "$INPUT")
+        local NEW_SIZE
+        NEW_SIZE=$($STAT_CMD "$TEMP_OUTPUT")
+        local SAVED
+        SAVED=$((OLD_SIZE - NEW_SIZE))
+        local PERCENT
+        PERCENT=$(echo "scale=1; ($SAVED * 100) / $OLD_SIZE" | bc -l)
+        
+        local end_time
+        end_time=$(date +%s)
+        local total_time
+        total_time=$((end_time - start_time))
+        local time_str
+        time_str=$(printf "%02d:%02d:%02d" $((total_time/3600)) $((total_time%3600/60)) $((total_time%60)))
+        
+        success "✅ Done: $(basename "$INPUT") in $time_str"
+        success "   Original:    $(numfmt --to=iec "$OLD_SIZE")"
+        success "   Compressed:  $(numfmt --to=iec "$NEW_SIZE")"
+        if (( SAVED >= 0 )); then
+            success "   Saved:       $(numfmt --to=iec $SAVED) (${PERCENT}%)"
+        else
+            warn "   ⚠️  File grew by $(numfmt --to=iec ${SAVED#-}) (keeping original)"
+            # Log for resume: skip this file on next run
+            if [[ -n "${SKIP_LOG:-}" ]]; then
+                printf '%s\n' "$INPUT" >> "$SKIP_LOG" || warn "   ⚠️  Could not write to skip log: $SKIP_LOG"
+            fi
+            rm -f "$TEMP_OUTPUT"
+            rm -f "$FFMPEG_ERR"
+            TEMP_OUTPUT=""  # Clear after cleanup
+            return 1
+        fi
+        
+        # Calculate VMAF if enabled (before replacing file)
+        if [[ "$CALCULATE_VMAF" == true ]]; then
+            local vmaf_score
+            vmaf_score=$(calculate_vmaf "$INPUT" "$TEMP_OUTPUT")
+            if [ -n "$vmaf_score" ]; then
+                success "   📊 VMAF score:   $vmaf_score"
+            fi
+        fi
+        
+        mv -f "$TEMP_OUTPUT" "$INPUT"
+        success "   🔁 Replaced original file"
+        
+        echo "$INPUT|$OLD_SIZE|$NEW_SIZE|$total_time" >> "$PROGRESS_FILE"
+        
+        # Clear TEMP_OUTPUT so cleanup doesn't try to delete it
+        TEMP_OUTPUT=""
+    else
+        _fn=$(basename "${INPUT:-}")
+        [[ -z "$_fn" ]] && _fn="(unknown file)"
+        echo -e "${C_RED}❌ Failed to compress $_fn${C_RESET}"
+        if [[ -n "${FFMPEG_ERR:-}" ]] && [[ -f "$FFMPEG_ERR" ]] && [[ -s "$FFMPEG_ERR" ]]; then
+            echo -e "${C_RED}   ffmpeg error (last lines):${C_RESET}" >&2
+            tail -n 25 "$FFMPEG_ERR" | sed 's/^/   /' >&2
+        fi
+        rm -f "$FFMPEG_ERR"
+        unset -v _fn
+        rm -f "$TEMP_OUTPUT"
+        TEMP_OUTPUT=""  # Clear after cleanup
+        return 1
+    fi
+    rm -f "$FFMPEG_ERR"
+}
+
+#####################################################
+# Built-in Parallel Processing
+#####################################################
+process_parallel() {
+    local files=("$@")
+    local total=${#files[@]}
+    local current=0
+    local active_jobs=0
+    local pids=()
+    
+    if [ "$JOBS" -eq 1 ]; then
+        # Count files that will actually be processed (silent)
+        local files_to_process=0
+        for file in "${files[@]}"; do
+            should_skip_file "$file" &>/dev/null || files_to_process=$((files_to_process + 1))
+        done
+        
+        log "🔄 Processing $files_to_process file(s) sequentially (1 at a time)"
+        echo ""
+        
+        for file in "${files[@]}"; do
+            should_skip_file "$file" && continue
+            
+            current=$((current + 1))
+            [[ "$QUIET" == false ]] && echo -e "${C_MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+            [[ "$QUIET" == false ]] && log "📦 Job $current/$files_to_process"
+            
+            process_file "$file"
+        done
+    elif [ "$USE_GNU_PARALLEL" = true ]; then
+        # Filter files (skip messages will show here)
+        local files_to_process=()
+        for file in "${files[@]}"; do
+            should_skip_file "$file" || files_to_process+=("$file")
+        done
+        
+        log "🔄 Processing ${#files_to_process[@]} file(s) with $JOBS parallel jobs (GNU Parallel)"
+        echo ""
+        
+        # Export function and variables for GNU Parallel
+        export -f process_file
+        export -f get_video_info
+        export -f get_codec_friendly_name
+        export -f calculate_adaptive_crf
+        export -f check_disk_space
+        export -f calculate_vmaf
+        export -f detect_hardware_av1_encoder
+        export -f show_progress
+        export -f log
+        export -f info
+        export -f success
+        export -f warn
+        export -f err
+        export ENCODER PRESET CRF AUTO_CRF QUIET JOBS
+        export USE_HARDWARE HW_ENCODER HW_DECODE HW_DECODE_DEVICE ENABLE_VARBOOST TUNE_GRAIN FORCE_10BIT
+        export CALCULATE_VMAF CHECK_DISK_SPACE
+        export PROGRESS_FILE STATE_FILE LOG_FILE SKIP_LOG
+        export STAT_CMD CPU_THREADS
+        export C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN C_BOLD C_RESET
+        
+        # Use GNU Parallel (--line-buffer for immediate output); {} quoted so path is single argument
+        printf '%s\n' "${files_to_process[@]}" | \
+            parallel --line-buffer -j "$JOBS" process_file '{}'
+    else
+        # Count files that will actually be processed (silent)
+        local files_to_process
+        files_to_process=0
+        for file in "${files[@]}"; do
+            should_skip_file "$file" &>/dev/null || files_to_process=$((files_to_process + 1))
+        done
+        
+        log "🔄 Processing $files_to_process file(s) with $JOBS parallel jobs"
+        echo ""
+        
+        export SKIP_LOG
+        for file in "${files[@]}"; do
+            should_skip_file "$file" && continue
+            
+            # Wait if we've reached max jobs
+            while [ $active_jobs -ge "$JOBS" ]; do
+                for i in "${!pids[@]}"; do
+                    if ! kill -0 "${pids[$i]}" 2>/dev/null; then
+                        wait "${pids[$i]}" 2>/dev/null
+                        unset 'pids[$i]'
+                        active_jobs=$((active_jobs - 1))
+                    fi
+                done
+                sleep 0.1
+            done
+            
+            current=$((current + 1))
+            [[ "$QUIET" == false ]] && echo -e "${C_MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+            [[ "$QUIET" == false ]] && log "📦 Job $current/$files_to_process"
+            
+            process_file "$file" &
+            pids+=($!)
+            active_jobs=$((active_jobs + 1))
+            
+            sleep 0.5
+            
+            # Check immediately if job finished (e.g., skipped due to disk space)
+            for i in "${!pids[@]}"; do
+                if ! kill -0 "${pids[$i]}" 2>/dev/null; then
+                    wait "${pids[$i]}" 2>/dev/null
+                    unset 'pids[$i]'
+                    active_jobs=$((active_jobs - 1))
+                fi
+            done
+        done
+        
+        # Wait for all remaining jobs
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null
+        done
+    fi
+}
+
+#####################################################
+# CLI OPTIONS
+#####################################################
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --preset=*) PRESET="${1#*=}"; shift ;;
+    --crf=*) 
+      CRF="${1#*=}"
+      AUTO_CRF=false
+      if (( CRF < 0 || CRF > 63 )); then
+        err "⚠️ Invalid CRF value. It must be between 0 and 63 (current: $CRF)."
+      fi
+      shift ;;
+    --jobs=*) 
+      JOBS="${1#*=}"
+      if (( JOBS > CPU_THREADS )); then
+        err "⚠️ The number of jobs (--jobs) cannot exceed the available CPU threads ($CPU_THREADS)."
+      fi
+      shift ;;
+    --encoder=*)
+      ENCODER="${1#*=}"
+      shift ;;
+    --skip-codec=*)
+      SKIP_CODECS+=("${1#*=}")
+      shift ;;
+    --interactive|-i)
+      INTERACTIVE=true
+      shift ;;
+    --list-codecs)
+      LIST_CODECS=true
+      shift ;;
+    --dry-run)
+      DRY_RUN=true
+      shift ;;
+    --notify)
+      SEND_NOTIFICATIONS=true
+      shift ;;
+    --vmaf)
+      CALCULATE_VMAF=true
+      shift ;;
+    --check-space)
+      CHECK_DISK_SPACE=true
+      shift ;;
+    --no-batch-eta)
+      SHOW_BATCH_ETA=false
+      shift ;;
+    --hw-encoder)
+      USE_HARDWARE=true
+      shift ;;
+    --hw-encoder=*)
+      USE_HARDWARE=true
+      HW_ENCODER="${1#*=}"
+      shift ;;
+    --hw-detect)
+      show_hardware_info
+      exit 0
+      ;;
+    --hw-decode)
+      HW_DECODE=true
+      shift ;;
+    --hw-decode=*)
+      HW_DECODE=true
+      HW_DECODE_DEVICE="${1#*=}"
+      shift ;;
+    --no-varboost)
+      ENABLE_VARBOOST=false
+      shift ;;
+    --tune-grain)
+      TUNE_GRAIN=true
+      shift ;;
+    --auto-jobs)
+      AUTO_JOBS=true
+      shift ;;
+    --force-10bit)
+      FORCE_10BIT=true
+      shift ;;
+    --recursive|-r)
+      RECURSIVE=true
+      shift ;;
+    --quiet|-q)
+      QUIET=true
+      shift ;;
+    --help|-h)
+      HELP=true
+      shift ;;
+    -*)
+      err "⚠️ Unknown option $1"
+      ;;
+    *) 
+      if [ -z "$TARGET_FOLDER" ]; then
+        TARGET_FOLDER="$1"
+      else
+        err "⚠️ Unknown argument '$1'"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Show help if requested
+if [[ "$HELP" == true ]]; then
+    echo -e "\033[1mshrink_all_mkv\033[0m v${VERSION} - Compress MKV files using AV1 encoder"
+    echo ""
+    echo -e "\033[1mUSAGE:\033[0m"
+    echo "    $(basename "$0") [options] [target_folder]"
+    echo ""
+    echo -e "\033[1mOPTIONS:\033[0m"
+    cat << EOF
+    --encoder <name>       AV1 encoder (libsvtav1, libaom-av1, librav1e)
+                          Default: auto-detect (prefers libsvtav1)
+    
+    --preset <value>       Encoding preset
+                          SVT-AV1: 0-13 (default: 6, higher=faster)
+                          libaom-av1: 0-8 (default: 6, higher=faster)
+                          rav1e: 0-10 (default: 6, higher=faster)
+    
+    --crf <value>         CRF for compression (0-63, lower=better quality)
+                          Default: auto-detect based on source quality
+    
+    --jobs <num>          Parallel jobs (default: 4, max: $CPU_THREADS)
+    
+    --skip-codec <codec>  Skip files with this codec (can be repeated)
+                          Example: --skip-codec hevc --skip-codec vp9
+    
+    --interactive, -i     Interactive mode with fzf file selection
+    
+    --list-codecs         Scan and display codec statistics for all MKV files
+                          (useful for planning conversion strategy)
+    
+    --dry-run             Show what would be done without actually encoding
+    
+    --notify              Send desktop notifications when batch completes
+    
+    --vmaf                Calculate VMAF quality scores (requires libvmaf, slower)
+    
+    --check-space         Check disk space before encoding each file
+    
+    --no-batch-eta        Disable batch time estimation
+    
+    --hw-encoder          Enable hardware AV1 encoding (auto-detect GPU)
+                          Supported: NVIDIA RTX 40+, Intel ARC, AMD RDNA3
+                          Speed: 50-100x faster than CPU
+    
+    --hw-encoder=<name>   Force specific hardware encoder
+                          Options: av1_nvenc, av1_qsv, av1_vaapi
+    
+    --hw-detect           Show available hardware encoders and exit
+    
+    --hw-decode           Enable hardware video decoding (auto-detect GPU)
+                          Supported: AMD, NVIDIA, Intel GPUs
+                          Benefit: 15-25% faster (frees up CPU for encoding)
+    
+    --hw-decode=<device>  Force specific hardware decoder
+                          Options: vaapi, cuda, qsv
+    
+    --no-varboost         Disable variance boost (quality optimization)
+                          Note: Variance boost is enabled by default
+    
+    --tune-grain          Optimize for film grain retention (use tune=4)
+                          Best for old films, grainy content
+    
+    --auto-jobs           Auto-calculate optimal job count based on content
+                          Analyzes resolution and preset to determine best value
+    
+    --force-10bit         Force 10-bit encoding (even if source is 8-bit)
+                          Better quality and compression, slight compatibility tradeoff
+    
+    --recursive, -r       Process files recursively in subdirectories
+                          Default: only current directory
+    
+    --quiet, -q           Suppress output (show only errors)
+    
+    --help, -h            Show this help message
+EOF
+    echo ""
+    echo -e "\033[1mEXAMPLES:\033[0m"
+    cat << EXAMPLES_EOF
+    # Process all MKV files in current directory (auto-detect CRF)
+    $(basename "$0")
+
+    # Interactive mode with file selection
+    $(basename "$0") --interactive /path/to/videos
+
+    # Use faster preset with specific CRF
+    $(basename "$0") --preset 8 --crf 35 /path/to/videos
+
+    # Use 8 parallel jobs with libaom-av1 encoder
+    $(basename "$0") --encoder libaom-av1 --jobs 8 /path/to/videos
+
+    # Skip already efficient codecs
+    $(basename "$0") --skip-codec hevc --skip-codec vp9
+
+    # Scan directory to see what codecs are present
+    $(basename "$0") --list-codecs /path/to/videos
+    
+    # Dry-run to preview what will be done
+    $(basename "$0") --dry-run /path/to/videos
+    
+    # Enable notifications for long batches
+    $(basename "$0") --notify --jobs 8 /path/to/videos
+    
+    # Calculate VMAF quality scores (sequential mode recommended)
+    $(basename "$0") --vmaf --jobs 1 /path/to/videos
+    
+    # Check available hardware encoders
+    $(basename "$0") --hw-detect
+    
+    # Use hardware encoding (50-100x faster!)
+    $(basename "$0") --hw-encoder --jobs 8 /path/to/videos
+    
+    # Optimize for film grain retention
+    $(basename "$0") --tune-grain --preset 4 /path/to/old-films
+    
+    # Auto-calculate optimal jobs
+    $(basename "$0") --auto-jobs /path/to/videos
+    
+    # Force 10-bit encoding for better quality (8-bit sources)
+    $(basename "$0") --force-10bit /path/to/videos
+    
+    # Process files recursively in all subdirectories
+    $(basename "$0") --recursive /path/to/videos
+    
+    # Recursive with hardware acceleration
+    $(basename "$0") --recursive --hw-decode --jobs 16 /path/to/videos
+EXAMPLES_EOF
+    echo ""
+    echo -e "\033[1mFEATURES:\033[0m"
+    cat << EOF
+    Core Features:
+    ✓ Auto-detects best AV1 encoder (SVT-AV1, libaom-av1, rav1e)
+    ✓ Auto-detects GNU Parallel (enhanced parallelization)
+    ✓ Smart codec detection (skips AV1 files)
+    ✓ Adaptive CRF based on resolution and source quality
+    ✓ Real-time progress with ETA (sequential mode)
+    ✓ Built-in parallel processing with smart job management
+    ✓ Interactive mode with fzf file selection
+    ✓ Configuration file support (~/.config/shrink_mkv/config)
+    
+    Hardware Acceleration:
+    ✓ Hardware AV1 encoding (NVIDIA RTX 40+, Intel ARC, AMD RDNA3)
+      → 50-100x faster than CPU!
+    ✓ Hardware video decoding (AMD, NVIDIA, Intel GPUs)
+      → 15-25% faster encoding (frees up CPU)
+    ✓ Auto-detects available hardware encoders and decoders
+    ✓ Automatic fallback to CPU if hardware unavailable
+    
+    Quality Optimizations:
+    ✓ Variance boost (3-8% quality improvement, enabled by default)
+    ✓ Content-aware CRF (smarter quality decisions)
+    ✓ Auto keyframe interval (better seeking)
+    ✓ Closed GOP (better compatibility)
+    ✓ 10-bit encoding support (auto-detect and preserve)
+    ✓ Optimized encoding parameters (better quality/speed)
+    ✓ Film grain optimization mode (--tune-grain)
+    
+    Analysis & Validation:
+    ✓ VMAF quality analysis (optional)
+    ✓ Optimized ffprobe (67% faster file analysis)
+    ✓ Disk space checking (optional)
+    ✓ Batch ETA estimation
+    
+    Workflow Features:
+    ✓ Dry-run mode (preview before encoding)
+    ✓ Desktop notifications
+    ✓ Resume capability
+    ✓ Enhanced logging
+    ✓ Auto-calculate optimal jobs (--auto-jobs)
+EOF
+    echo ""
+    echo -e "\033[1mRECOMMENDED ENCODERS:\033[0m"
+    cat << EOF
+    • libsvtav1   - Best balance (fast + good quality) ⭐
+    • libaom-av1  - Highest quality (very slow)
+    • librav1e    - Fastest (lower efficiency)
+
+EOF
+    exit 0
+fi
+
+#####################################################
+# MAIN EXECUTION
+#####################################################
+
+# Check dependencies
+need ffmpeg
+need ffprobe
+need bc
+need numfmt
+
+# Auto-detect encoder if not specified
+if [ -z "$ENCODER" ]; then
+    ENCODER=$(detect_av1_encoder)
+    
+    # Debug: verify encoder value
+    if [[ "$ENCODER" =~ [[:space:]] ]] || [[ "$ENCODER" =~ $'\n' ]]; then
+        echo "❌ ERROR: Encoder detection returned invalid value:" >&2
+        echo "   Value: [$ENCODER]" >&2
+        echo "   Length: ${#ENCODER} characters" >&2
+        echo "   This might be due to shell compatibility issues." >&2
+        echo "" >&2
+        echo "Please specify encoder manually:" >&2
+        echo "   $0 --encoder libsvtav1 [other options]" >&2
+        exit 1
+    fi
+    
+    # Show which encoder was auto-detected
+    case "$ENCODER" in
+        libsvtav1)
+            [[ "$QUIET" == false ]] && info "🎯 Detected SVT-AV1 encoder (best balance of speed/quality)"
+            ;;
+        libaom-av1)
+            [[ "$QUIET" == false ]] && warn "⚠️  Detected libaom-av1 encoder (high quality but VERY slow)"
+            ;;
+        librav1e)
+            [[ "$QUIET" == false ]] && warn "⚠️  Detected rav1e encoder (fast but lower efficiency)"
+            ;;
+    esac
+else
+    # User specified encoder manually
+    [[ "$QUIET" == false ]] && info "🎯 Using manually specified encoder: $ENCODER"
+fi
+
+# Verify encoder is available
+if [ -z "$ENCODER" ]; then
+    err "❌ Failed to detect AV1 encoder"
+fi
+
+encoders_available=$(ffmpeg -hide_banner -encoders 2>&1)
+if ! echo "$encoders_available" | grep -qw "$ENCODER"; then
+    echo "" >&2
+    echo "❌ Encoder '$ENCODER' not available in your ffmpeg build" >&2
+    echo "" >&2
+    echo "Available AV1 encoders:" >&2
+    echo "$encoders_available" | grep -i av1 >&2
+    echo "" >&2
+    exit 1
+fi
+
+# Auto-detect GNU Parallel (use it if available, fallback to built-in)
+if command -v parallel >/dev/null 2>&1; then
+    # Verify it's GNU Parallel (not moreutils parallel)
+    if parallel --version 2>/dev/null | grep -q "GNU parallel"; then
+        USE_GNU_PARALLEL=true
+        [[ "$QUIET" == false ]] && info "✨ Detected GNU Parallel (enhanced parallelization)"
+    fi
+fi
+
+# Default to current directory if no folder is provided
+TARGET_FOLDER="${TARGET_FOLDER:-$(pwd)}"
+
+# Check if target folder exists
+if [ ! -d "$TARGET_FOLDER" ]; then
+    err "❌ Error: Folder '$TARGET_FOLDER' not found."
+fi
+
+# All log/progress files in target directory (absolute path)
+TARGET_ABS=$(cd "$TARGET_FOLDER" 2>/dev/null && pwd) || true
+[[ -z "$TARGET_ABS" ]] && TARGET_ABS="$TARGET_FOLDER"
+PROGRESS_FILE="${TARGET_ABS}/.shrink_mkv_progress_$$"
+STATE_FILE="${TARGET_ABS}/.shrink_mkv_state_$$"
+LOG_FILE="${TARGET_ABS}/.shrink_mkv_$$.log"
+CONFIG_FILE="${TARGET_ABS}/.shrink_mkv_config_$$"
+
+# If list-codecs mode, run and exit
+if [[ "$LIST_CODECS" == true ]]; then
+    list_codecs
+    exit 0
+fi
+
+# Display configuration
+log "╔════════════════════════════════════════════════════════════╗"
+log "║        MKV → AV1 Compression Tool                          ║"
+log "╚════════════════════════════════════════════════════════════╝"
+log ""
+log "📂 Target: $TARGET_FOLDER"
+if [[ "$RECURSIVE" == true ]]; then
+    log "📁 Mode: Recursive (includes subdirectories)"
+fi
+log "🎯 Encoder: $ENCODER"
+log "⚙️  Preset: $PRESET"
+log "🎚️  CRF: ${CRF:-auto-detect}"
+if [[ "$FORCE_10BIT" == true ]]; then
+    log "🎨 Bit depth: 10-bit (forced)"
+fi
+log "⚡ Parallel Jobs: $JOBS / $CPU_THREADS"
+if [ ${#SKIP_CODECS[@]} -gt 0 ]; then
+    log "⏭️  Skipping codecs: ${SKIP_CODECS[*]}"
+fi
+log ""
+
+# Initialize progress file
+: > "$PROGRESS_FILE"
+
+# Get files to process
+if [[ "$INTERACTIVE" == true ]]; then
+    mapfile -t FILES < <(interactive_mode)
+    
+    # Read configuration set by interactive mode (from file in target directory)
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+        rm -f "$CONFIG_FILE"
+    fi
+else
+    # File discovery with recursive control
+    if [[ "$RECURSIVE" == true ]]; then
+        mapfile -t FILES < <(find "$TARGET_FOLDER" -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    else
+        mapfile -t FILES < <(find "$TARGET_FOLDER" -maxdepth 1 -type f -iname "*.mkv" -not -name "*_temp.mkv" | sort)
+    fi
+fi
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    warn "⚠️  No MKV files found in '$TARGET_FOLDER'"
+    exit 0
+fi
+
+# Skip log: files that grew after encode (kept for resume; removed only on normal exit)
+# Creation is optional: if we can't write in target folder, we continue without (never abort)
+SKIP_LOG="${TARGET_ABS}/.shrink_mkv_skipped.log"
+
+# Filter out files previously skipped (result was larger) for resume support
+declare -A skip_list
+if [[ -f "$SKIP_LOG" ]] && [[ -s "$SKIP_LOG" ]]; then
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        skip_list["$path"]=1
+    done < "$SKIP_LOG"
+fi
+resumed_skip_count=0
+new_files=()
+for f in "${FILES[@]}"; do
+    if [[ -n "${skip_list[$f]:-}" ]]; then
+        ((resumed_skip_count++)) || true
+        warn "⏭️  Skipping $(basename "$f") (larger than original)"
+    else
+        new_files+=("$f")
+    fi
+done
+FILES=("${new_files[@]}")
+if [[ "$resumed_skip_count" -gt 0 ]]; then
+    info "📋 Resuming: skipping $resumed_skip_count file(s) previously skipped (result was larger)"
+fi
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    warn "⚠️  No files left to process (all skipped or in skip log)"
+    exit 0
+fi
+
+# Auto-calculate optimal jobs if enabled
+if [[ "$AUTO_JOBS" == true ]]; then
+    # Sample first file to get resolution
+    first_file="${FILES[0]}"
+    auto_jobs_info=$(get_video_info "$first_file")
+    auto_jobs_width=$(echo "$auto_jobs_info" | cut -d'|' -f3)
+    auto_jobs_height=$(echo "$auto_jobs_info" | cut -d'|' -f4)
+    resolution="${auto_jobs_width}x${auto_jobs_height}"
+    
+    JOBS=$(calculate_optimal_jobs "$resolution" "$PRESET")
+    info "🔧 Auto-calculated optimal jobs: $JOBS (based on ${resolution}, preset $PRESET)"
+fi
+
+# Log batch start (minimal overhead - only once per batch)
+log_to_file "Starting batch: ${#FILES[@]} files, Preset: $PRESET, Jobs: $JOBS"
+
+# Estimate batch processing time if enabled
+estimate_batch_time "${FILES[@]}"
+
+# Process files
+process_parallel "${FILES[@]}"
+
+# Show summary
+echo ""
+log "╔════════════════════════════════════════════════════════════╗"
+log "║                      SUMMARY                               ║"
+log "╚════════════════════════════════════════════════════════════╝"
+
+if [ -f "$PROGRESS_FILE" ] && [ -s "$PROGRESS_FILE" ]; then
+    total_original=0
+    total_compressed=0
+    total_time=0
+    count=0
+    
+    while IFS='|' read -r file old_size new_size time; do
+        total_original=$((total_original + old_size))
+        total_compressed=$((total_compressed + new_size))
+        total_time=$((total_time + time))
+        count=$((count + 1))
+    done < "$PROGRESS_FILE"
+    
+    total_saved=$((total_original - total_compressed))
+    avg_percent=$(echo "scale=1; ($total_saved * 100) / $total_original" | bc -l)
+    time_str=$(printf "%02d:%02d:%02d" $((total_time/3600)) $((total_time%3600/60)) $((total_time%60)))
+    
+    success "✅ Successfully processed: $count file(s)"
+    success "📊 Total original size:    $(numfmt --to=iec $total_original)"
+    success "📊 Total compressed size:  $(numfmt --to=iec $total_compressed)"
+    success "💾 Total space saved:      $(numfmt --to=iec $total_saved) (${avg_percent}%)"
+    success "⏱️  Total processing time:  $time_str"
+    
+    # Send notification
+    send_notification "MKV Compression Complete" "Processed $count files, saved $(numfmt --to=iec $total_saved) (${avg_percent}%)"
+    
+    # Single log entry at end (minimal overhead)
+    log_to_file "Batch complete: $count files, saved $(numfmt --to=iec $total_saved) (${avg_percent}%), time: $time_str"
+else
+    warn "⚠️  No files were successfully processed"
+fi
+
+# Cleanup
+rm -f "$PROGRESS_FILE"
+clear_state
+
+# Remove skip log only on normal exit (kept on interrupt for resume)
+if [[ -n "${SKIP_LOG:-}" ]] && [[ -f "$SKIP_LOG" ]]; then
+    rm -f "$SKIP_LOG"
+fi
+
+success ""
+success "🏁 All done!"
