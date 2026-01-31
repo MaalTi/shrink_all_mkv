@@ -1455,6 +1455,11 @@ cleanup() {
         rm -f "$CONFIG_FILE"
     fi
     
+    # Clean up log file
+    if [ -n "${LOG_FILE:-}" ]; then
+        rm -f "$LOG_FILE"
+    fi
+    
     # Kill all background jobs and their child processes (ffmpeg)
     local bg_jobs
     bg_jobs=$(jobs -p)
