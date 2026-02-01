@@ -1460,6 +1460,11 @@ cleanup() {
         rm -f "$LOG_FILE"
     fi
     
+    # Also clean up any orphaned .shrink_mkv_*.log files in target folder
+    if [ -n "$TARGET_FOLDER" ] && [ -d "$TARGET_FOLDER" ]; then
+        find "$TARGET_FOLDER" -maxdepth 1 -name ".shrink_mkv_*.log" -delete 2>/dev/null
+    fi
+    
     # Kill all background jobs and their child processes (ffmpeg)
     local bg_jobs
     bg_jobs=$(jobs -p)
@@ -2360,7 +2365,7 @@ fi
 
 # Skip log: files that grew after encode (kept for resume; removed only on normal exit)
 # Creation is optional: if we can't write in target folder, we continue without (never abort)
-SKIP_LOG="${TARGET_ABS}/.shrink_mkv_skipped.log"
+SKIP_LOG="${TARGET_ABS}/.skipped_shrink_mkv.log"
 
 # Filter out files previously skipped (result was larger) for resume support
 declare -A skip_list
