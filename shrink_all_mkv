@@ -1876,6 +1876,7 @@ process_parallel() {
         export -f check_disk_space
         export -f calculate_vmaf
         export -f detect_hardware_av1_encoder
+        export -f detect_hardware_decode
         export -f show_progress
         export -f log
         export -f info
