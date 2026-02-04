@@ -1883,6 +1883,7 @@ process_parallel() {
         export -f success
         export -f warn
         export -f err
+        export -f log_to_file
         export ENCODER PRESET CRF AUTO_CRF QUIET JOBS
         export USE_HARDWARE HW_ENCODER HW_DECODE HW_DECODE_DEVICE ENABLE_VARBOOST TUNE_GRAIN FORCE_10BIT
         export CALCULATE_VMAF CHECK_DISK_SPACE
