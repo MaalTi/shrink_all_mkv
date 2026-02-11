@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-VERSION="3.2.1"
+VERSION="3.2.2"
 
 #####################################################
 # COLORS
@@ -41,6 +41,15 @@ warn() { [[ "$QUIET" == true ]] || echo -e "${C_YELLOW}$1${C_RESET}"; }
 err() { echo -e "${C_RED}$1${C_RESET}" >&2; exit 1; }
 info() { [[ "$QUIET" == true ]] || echo -e "${C_BLUE}$1${C_RESET}"; }
 need() { command -v "$1" >/dev/null || err "❌ '$1' is required. Install it first."; }
+
+# Run ffmpeg, optionally under a memory limit (Linux: systemd-run + cgroups)
+run_ffmpeg() {
+    if [[ -n "${MEMORY_LIMIT:-}" ]] && [[ "$(uname)" == "Linux" ]] && command -v systemd-run &>/dev/null; then
+        systemd-run --scope -p MemoryMax="$MEMORY_LIMIT" -p MemorySwapMax=0 -- ffmpeg "$@"
+    else
+        ffmpeg "$@"
+    fi
+}
 
 #####################################################
 # PLATFORM-SPECIFIC CONFIGURATIONS
@@ -93,6 +102,8 @@ USE_GNU_PARALLEL=false  # Auto-detected below
 AUTO_JOBS=false
 FORCE_10BIT=false
 RECURSIVE=false
+KEEP_SKIP_LOG=false     # If true, do not remove .skipped_shrink_mkv.log at end
+MEMORY_LIMIT=""         # If set (e.g. 2G, 512M), limit RAM per ffmpeg process (Linux, systemd-run)
 
 # Configuration file location
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/shrink_mkv/config"
@@ -178,8 +189,11 @@ should_skip_file() {
     info=$(get_video_info "$file")
     codec=$(echo "$info" | cut -d'|' -f1)
     
-    # Skip if already AV1
+    # Skip if already AV1 (log for next run to skip without ffprobe)
     if [[ "$codec" == "av1" ]]; then
+        if [[ -n "${SKIP_LOG:-}" ]]; then
+            printf '%s\n' "av1|$file" >> "$SKIP_LOG" || true
+        fi
         warn "⏭️  Skipping $(basename "$file") (already AV1)"
         return 0
     fi
@@ -1709,7 +1723,7 @@ process_file() {
 
     if [[ "$QUIET" == true ]] || [[ "$JOBS" -gt 1 ]]; then
         if [ "$using_hw" = true ] && [ "$hw_encoder" = "av1_vaapi" ]; then
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 -vf "format=nv12,hwupload" \
                 $encoder_opts \
                 -c:a copy \
@@ -1717,14 +1731,14 @@ process_file() {
                 -map 0:v:0 -map 0:a? -map 0:s? \
                 -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
         elif [ "$using_hw" = true ]; then
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 $encoder_opts \
                 -c:a copy \
                 -c:s copy \
                 -map 0:v:0 -map 0:a? -map 0:s? \
                 -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
         else
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 -pix_fmt "$target_pix_fmt" \
                 -c:v "$ENCODER" $encoder_opts \
                 -c:a copy \
@@ -1735,7 +1749,7 @@ process_file() {
         local exit_code=$?
     else
         if [ "$using_hw" = true ] && [ "$hw_encoder" = "av1_vaapi" ]; then
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 -vf "format=nv12,hwupload" \
                 $encoder_opts \
                 -c:a copy \
@@ -1743,14 +1757,14 @@ process_file() {
                 -map 0:v:0 -map 0:a? -map 0:s? \
                 -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
         elif [ "$using_hw" = true ]; then
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 $encoder_opts \
                 -c:a copy \
                 -c:s copy \
                 -map 0:v:0 -map 0:a? -map 0:s? \
                 -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
         else
-            ffmpeg $hw_decode_opts -i "$INPUT" \
+            run_ffmpeg $hw_decode_opts -i "$INPUT" \
                 -pix_fmt "$target_pix_fmt" \
                 -c:v "$ENCODER" $encoder_opts \
                 -c:a copy \
@@ -1788,7 +1802,7 @@ process_file() {
             warn "   ⚠️  File grew by $(numfmt --to=iec ${SAVED#-}) (keeping original)"
             # Log for resume: skip this file on next run
             if [[ -n "${SKIP_LOG:-}" ]]; then
-                printf '%s\n' "$INPUT" >> "$SKIP_LOG" || warn "   ⚠️  Could not write to skip log: $SKIP_LOG"
+                printf '%s\n' "larger|$INPUT" >> "$SKIP_LOG" || warn "   ⚠️  Could not write to skip log: $SKIP_LOG"
             fi
             rm -f "$TEMP_OUTPUT"
             rm -f "$FFMPEG_ERR"
@@ -1888,7 +1902,8 @@ process_parallel() {
         export USE_HARDWARE HW_ENCODER HW_DECODE HW_DECODE_DEVICE ENABLE_VARBOOST TUNE_GRAIN FORCE_10BIT
         export CALCULATE_VMAF CHECK_DISK_SPACE
         export PROGRESS_FILE STATE_FILE LOG_FILE SKIP_LOG
-        export STAT_CMD CPU_THREADS
+        export STAT_CMD CPU_THREADS MEMORY_LIMIT
+        export -f run_ffmpeg
         export C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN C_BOLD C_RESET
         
         # Use GNU Parallel (--line-buffer for immediate output); {} quoted so path is single argument
@@ -1905,7 +1920,8 @@ process_parallel() {
         log "🔄 Processing $files_to_process file(s) with $JOBS parallel jobs"
         echo ""
         
-        export SKIP_LOG
+        export SKIP_LOG MEMORY_LIMIT
+        export -f run_ffmpeg
         for file in "${files[@]}"; do
             should_skip_file "$file" && continue
             
@@ -2030,6 +2046,17 @@ while [[ $# -gt 0 ]]; do
     --quiet|-q)
       QUIET=true
       shift ;;
+    --keep-skip-log)
+      KEEP_SKIP_LOG=true
+      shift ;;
+    --memory-limit)
+      MEMORY_LIMIT="${2:-}"
+      [[ -z "$MEMORY_LIMIT" ]] && err "❌ --memory-limit requires a value (e.g. 2G, 512M)"
+      shift 2 ;;
+    --memory-limit=*)
+      MEMORY_LIMIT="${1#*=}"
+      [[ -z "$MEMORY_LIMIT" ]] && err "❌ --memory-limit requires a value (e.g. 2G, 512M)"
+      shift ;;
     --help|-h)
       HELP=true
       shift ;;
@@ -2119,6 +2146,12 @@ if [[ "$HELP" == true ]]; then
                           Default: only current directory
     
     --quiet, -q           Suppress output (show only errors)
+    
+    --keep-skip-log       Do not remove .skipped_shrink_mkv.log at end
+                          (in interactive mode, you can also choose at the end)
+    
+    --memory-limit <size> Limit RAM per ffmpeg process (e.g. 2G, 512M)
+                          Linux only: uses systemd-run + cgroups; ignored elsewhere
     
     --help, -h            Show this help message
 EOF
@@ -2369,27 +2402,48 @@ fi
 # Creation is optional: if we can't write in target folder, we continue without (never abort)
 SKIP_LOG="${TARGET_ABS}/.skipped_shrink_mkv.log"
 
-# Filter out files previously skipped (result was larger) for resume support
+# Filter out files previously skipped (result was larger or already AV1) for resume support
+# Log format: "reason|path" (av1|path, larger|path) or legacy "path" only (= larger)
 declare -A skip_list
 if [[ -f "$SKIP_LOG" ]] && [[ -s "$SKIP_LOG" ]]; then
-    while IFS= read -r path; do
-        [[ -z "$path" ]] && continue
-        skip_list["$path"]=1
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == *"|"* ]]; then
+            reason="${line%%|*}"
+            path="${line#*|}"
+        else
+            path="$line"
+            reason="larger"
+        fi
+        skip_list["$path"]="$reason"
     done < "$SKIP_LOG"
 fi
-resumed_skip_count=0
+resumed_av1_count=0
+resumed_larger_count=0
 new_files=()
 for f in "${FILES[@]}"; do
-    if [[ -n "${skip_list[$f]:-}" ]]; then
-        ((resumed_skip_count++)) || true
-        warn "⏭️  Skipping $(basename "$f") (larger than original)"
+    reason="${skip_list[$f]:-}"
+    if [[ -n "$reason" ]]; then
+        if [[ "$reason" == "av1" ]]; then
+            ((resumed_av1_count++)) || true
+            warn "⏭️  Skipping $(basename "$f") (already AV1)"
+        else
+            ((resumed_larger_count++)) || true
+            warn "⏭️  Skipping $(basename "$f") (larger than original)"
+        fi
     else
         new_files+=("$f")
     fi
 done
 FILES=("${new_files[@]}")
-if [[ "$resumed_skip_count" -gt 0 ]]; then
-    info "📋 Resuming: skipping $resumed_skip_count file(s) previously skipped (result was larger)"
+if [[ $((resumed_av1_count + resumed_larger_count)) -gt 0 ]]; then
+    if [[ "$resumed_av1_count" -gt 0 ]] && [[ "$resumed_larger_count" -gt 0 ]]; then
+        info "📋 Resuming: skipping $resumed_av1_count file(s) already AV1, $resumed_larger_count file(s) larger than original"
+    elif [[ "$resumed_av1_count" -gt 0 ]]; then
+        info "📋 Resuming: skipping $resumed_av1_count file(s) already AV1"
+    else
+        info "📋 Resuming: skipping $resumed_larger_count file(s) previously skipped (result was larger)"
+    fi
 fi
 
 if [ ${#FILES[@]} -eq 0 ]; then
@@ -2415,6 +2469,15 @@ log_to_file "Starting batch: ${#FILES[@]} files, Preset: $PRESET, Jobs: $JOBS"
 
 # Estimate batch processing time if enabled
 estimate_batch_time "${FILES[@]}"
+
+# Memory limit: only effective on Linux with systemd-run
+if [[ -n "${MEMORY_LIMIT:-}" ]]; then
+    if [[ "$(uname)" == "Linux" ]] && command -v systemd-run &>/dev/null; then
+        [[ "$QUIET" != true ]] && info "🧠 Memory limit: ${MEMORY_LIMIT} per ffmpeg process (systemd-run)"
+    else
+        [[ "$QUIET" != true ]] && warn "⚠️  --memory-limit ${MEMORY_LIMIT} ignored (Linux + systemd-run required)"
+    fi
+fi
 
 # Process files
 process_parallel "${FILES[@]}"
@@ -2461,9 +2524,20 @@ fi
 rm -f "$PROGRESS_FILE"
 clear_state
 
-# Remove skip log only on normal exit (kept on interrupt for resume)
+# Remove skip log on normal exit unless user chose to keep it (option or TUI)
 if [[ -n "${SKIP_LOG:-}" ]] && [[ -f "$SKIP_LOG" ]]; then
-    rm -f "$SKIP_LOG"
+    remove_skip_log=true
+    if [[ "$KEEP_SKIP_LOG" == true ]]; then
+        remove_skip_log=false
+        [[ "$QUIET" != true ]] && info "📋 Skip log kept: $SKIP_LOG"
+    elif [[ "$INTERACTIVE" == true ]] && [[ "$QUIET" != true ]]; then
+        echo ""
+        read -r -p "Conserver .skipped_shrink_mkv.log pour le prochain passage ? (o/N) " answer
+        [[ "$answer" =~ ^[oOyY] ]] && remove_skip_log=false
+    fi
+    if [[ "$remove_skip_log" == true ]]; then
+        rm -f "$SKIP_LOG"
+    fi
 fi
 
 success ""

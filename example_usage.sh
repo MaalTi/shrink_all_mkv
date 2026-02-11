@@ -1,6 +1,6 @@
 #!/bin/bash
 # shrink_all_mkv - Example Usage Script
-# Version: 3.2.1
+# Version: 3.2.2
 # 
 # This script demonstrates various usage patterns and features.
 # Choose a scenario that matches your needs!
@@ -16,7 +16,7 @@ C_RESET="\033[0m"
 
 echo -e "${C_BOLD}╔═══════════════════════════════════════════════════════════╗${C_RESET}"
 echo -e "${C_BOLD}║       shrink_all_mkv - Example Usage Scenarios           ║${C_RESET}"
-echo -e "${C_BOLD}║                  Version 3.2.1                            ║${C_RESET}"
+echo -e "${C_BOLD}║                  Version 3.2.2                            ║${C_RESET}"
 echo -e "${C_BOLD}╚═══════════════════════════════════════════════════════════╝${C_RESET}"
 echo ""
 

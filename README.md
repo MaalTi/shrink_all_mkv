@@ -44,9 +44,10 @@ High-performance batch video compression script that converts MKV files to AV1 f
 - **Dry-run mode** - Preview what will be done
 - **Desktop notifications** - Alert when batch completes
 - **Interrupted summary** - See progress when manually stopped (Ctrl+C)
-- **Skip log (resume)** - Files that grew after encode are logged; on re-run they are skipped (log in target folder, removed only on normal exit)
+- **Skip log (resume)** - Files that grew after encode or are already AV1 are logged in the target folder (`.skipped_shrink_mkv.log`); on re-run they are skipped without reading metadata. Log removed on normal exit unless you use `--keep-skip-log` or choose to keep it when prompted in interactive mode.
 - **VMAF quality analysis** - Measure output quality (optional)
 - **Disk space checking** - Prevent failures from full disk
+- **Memory limit** - Cap RAM per ffmpeg process with `--memory-limit` (e.g. `2G`); Linux only, uses systemd-run + cgroups
 - **Configuration file** - Save your preferred settings
 
 ---
@@ -216,6 +217,12 @@ shrink_all_mkv --hw-encoder --jobs 8 /videos
                          Default: only current directory
 
 --quiet, -q              Suppress output (errors only)
+
+--keep-skip-log          Do not remove .skipped_shrink_mkv.log at end
+                         (in interactive mode, you can also choose at the end)
+
+--memory-limit <size>    Limit RAM per ffmpeg process (e.g. 2G, 512M)
+                         Linux only: uses systemd-run + cgroups
 
 --help, -h               Show help message
 ```
@@ -732,7 +739,7 @@ When you hit Ctrl+C after processing at least one file, you'll see:
 
 **Benefit:** Know what was accomplished even if stopping early
 
-**Resume:** Files that were skipped because the encoded version was larger are logged in the target folder (`.shrink_mkv_skipped.log`). On the next run they are skipped automatically. The log is only removed when the script finishes normally.
+**Resume:** Two types of skips are logged in the target folder (`.skipped_shrink_mkv.log`): files whose encoded version was larger than the original, and files already in AV1 (so the next run can skip them without reading metadata). On the next run these files are skipped automatically. By default the log is removed when the script finishes normally. You can keep it with the **`--keep-skip-log`** option, or in **interactive mode** you will be asked at the end: "Conserver .skipped_shrink_mkv.log pour le prochain passage ? (o/N)". Format: one entry per line, either `av1|path` or `larger|path` (legacy lines with path only are treated as "larger").
 
 ---
 
@@ -769,5 +776,5 @@ For issues specific to:
 
 ---
 
-**Version:** 3.2.1
-**Last Updated:** January 2026
+**Version:** 3.2.2
+**Last Updated:** Febuary 2026
