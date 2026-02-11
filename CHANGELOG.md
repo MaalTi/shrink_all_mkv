@@ -4,6 +4,36 @@ All notable changes to shrink_all_mkv are documented in this file.
 
 ---
 
+## [3.2.2] - 2026-02-11
+
+### Added
+
+#### Skip log: files already AV1
+
+- **New:** Files skipped because they are already in AV1 are now written to the skip log (`.skipped_shrink_mkv.log`) with prefix `av1|path`
+- **Benefit:** On the next run these files are skipped without reading metadata (no ffprobe), which is faster on large batches
+- **Format:** Log entries are `av1|path` or `larger|path`; legacy lines with path only are treated as "larger"
+
+#### Skip log: keep or remove at end
+
+- **New:** `--keep-skip-log` option to never remove `.skipped_shrink_mkv.log` at end of run
+- **New:** In interactive mode, a prompt at the end: "Conserver .skipped_shrink_mkv.log pour le prochain passage ? (o/N)"
+- **Default:** Log is still removed on normal exit unless you use the option or answer "o" when prompted
+
+#### Memory limit per ffmpeg process
+
+- **New:** `--memory-limit <size>` (e.g. `2G`, `512M`) to cap RAM per ffmpeg process
+- **Linux only:** Uses `systemd-run --scope` with cgroups (`MemoryMax`, `MemorySwapMax=0`)
+- **Use case:** Avoid OOM when running many parallel jobs; each worker is limited
+- **Fallback:** On non-Linux or without systemd-run, option is ignored with a warning
+
+### Changed
+
+- **Skip log:** "Larger than original" entries now written as `larger|path` for consistency
+- **Resume messages:** Distinct counts for "already AV1" vs "larger than original" when loading from skip log
+
+---
+
 ## [3.2.1] - 2026-01-30
 
 ### Added
