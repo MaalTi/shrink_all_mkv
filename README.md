@@ -92,7 +92,7 @@ shrink_all_mkv --quiet --notify --jobs 8 /videos
 - **ffmpeg** with AV1 encoder support (libsvtav1, libaom-av1, or librav1e)
 - **ffprobe** (usually included with ffmpeg)
 - **bash** 4.0 or higher
-- **bc** (for calculations)
+- **awk** (for calculations)
 
 ### Optional (but recommended)
 
@@ -106,13 +106,13 @@ shrink_all_mkv --quiet --notify --jobs 8 /videos
 
 ```bash
 # Arch Linux
-sudo pacman -S ffmpeg bc gnu-parallel fzf libnotify
+sudo pacman -S ffmpeg gnu-parallel fzf libnotify
 
 # Ubuntu/Debian
-sudo apt install ffmpeg bc parallel fzf libnotify-bin
+sudo apt install ffmpeg parallel fzf libnotify-bin
 
 # macOS (Homebrew)
-brew install ffmpeg bc parallel fzf
+brew install ffmpeg parallel fzf
 ```
 
 ---
@@ -736,7 +736,7 @@ When you hit Ctrl+C after processing at least one file, you'll see:
 
 **Benefit:** Know what was accomplished even if stopping early
 
-**Resume:** Two types of skips are logged in the target folder (`.skipped_shrink_mkv.log`): files whose encoded version was larger than the original, and files already in AV1 (so the next run can skip them without reading metadata). On the next run these files are skipped automatically. By default the log is removed when the script finishes normally. You can keep it with the **`--keep-skip-log`** option, or in **interactive mode** you will be asked at the end: "Conserver .skipped_shrink_mkv.log pour le prochain passage ? (o/N)". Format: one entry per line, either `av1|path` or `larger|path` (legacy lines with path only are treated as "larger").
+**Resume:** Two types of skips are logged in the target folder (`.skipped_shrink_mkv.log`): files whose encoded version was larger than the original, and files already in AV1 (so the next run can skip them without reading metadata). On the next run these files are skipped automatically. By default the log is removed when the script finishes normally. You can keep it with the **`--keep-skip-log`** option, or in **interactive mode** you will be asked at the end: "Keep .skipped_shrink_mkv.log for the next run? (y/N)". Format: one entry per line, either `av1|path` or `larger|path` (legacy lines with path only are treated as "larger").
 
 ---
 
@@ -773,5 +773,5 @@ For issues specific to:
 
 ---
 
-**Version:** 1.0.0
-**Last Updated:** February 2026
+**Version:** 1.0.1
+**Last Updated:** May 2026

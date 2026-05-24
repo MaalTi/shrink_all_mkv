@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 #####################################################
 # COLORS
@@ -762,16 +762,16 @@ show_progress() {
                 # progress=continue or progress=end
                 if [ "$value" = "continue" ] || [ "$value" = "end" ]; then
                     # Calculate progress percentage
-                    if (( $(echo "$duration > 0" | bc -l 2>/dev/null || echo 0) )); then
+                    if (( $(awk -v d="$duration" 'BEGIN {print (d > 0)}') )); then
                         local progress
                         progress=$(awk -v curr="$current_seconds" -v dur="$duration" 'BEGIN {printf "%.1f", (curr / dur) * 100}')
                         
                         # Calculate ETA
                         local eta="N/A"
-                        if (( $(echo "$fps > 0" | bc -l 2>/dev/null || echo 0) )); then
+                        if (( $(awk -v f="$fps" 'BEGIN {print (f > 0)}') )); then
                             local remaining
                             remaining=$(awk -v dur="$duration" -v curr="$current_seconds" 'BEGIN {print dur - curr}')
-                            if (( $(echo "$remaining > 0" | bc -l 2>/dev/null || echo 0) )); then
+                            if (( $(awk -v r="$remaining" 'BEGIN {print (r > 0)}') )); then
                                 local eta_hours
                                 local eta_minutes
                                 local eta_seconds
@@ -1398,7 +1398,7 @@ show_interrupted_summary() {
     local total_saved=$((total_original - total_compressed))
     local avg_percent
     local time_str
-    avg_percent=$(echo "scale=1; ($total_saved * 100) / $total_original" | bc -l)
+    avg_percent=$(awk -v s="$total_saved" -v o="$total_original" 'BEGIN {printf "%.1f", (s * 100) / o}')
     time_str=$(printf "%02d:%02d:%02d" $((total_time/3600)) $((total_time%3600/60)) $((total_time%60)))
     
     echo ""
@@ -1442,7 +1442,11 @@ cleanup() {
     # Also search for any *_temp.mkv files in target folder
     if [ -n "$TARGET_FOLDER" ] && [ -d "$TARGET_FOLDER" ]; then
         local temp_files
-        temp_files=$(find "$TARGET_FOLDER" -maxdepth 1 -name "*_temp.mkv" 2>/dev/null)
+        if [[ "$RECURSIVE" == true ]]; then
+            temp_files=$(find "$TARGET_FOLDER" -type f -name "*_temp.mkv" 2>/dev/null)
+        else
+            temp_files=$(find "$TARGET_FOLDER" -maxdepth 1 -type f -name "*_temp.mkv" 2>/dev/null)
+        fi
         if [ -n "$temp_files" ]; then
             if [ "$found_temp" = false ]; then
                 echo -e "\n${C_RED}🚨 Interrupted! Cleaning up temporary files...${C_RESET}" >&2
@@ -1502,7 +1506,10 @@ cleanup() {
         done
         
         # Also kill any ffmpeg processes that might be orphaned
-        pkill -KILL -f "ffmpeg.*$TARGET_FOLDER.*_temp.mkv" 2>/dev/null
+        # Escape TARGET_FOLDER to avoid regex dot matching issues
+        local escaped_target
+        escaped_target=$(printf '%s\n' "$TARGET_FOLDER" | sed 's/[.[\*^$]/\\&/g')
+        pkill -KILL -f "ffmpeg.*${escaped_target}.*_temp.mkv" 2>/dev/null
     fi
     
     # Always exit after cleanup (don't continue processing)
@@ -1784,7 +1791,7 @@ process_file() {
         local SAVED
         SAVED=$((OLD_SIZE - NEW_SIZE))
         local PERCENT
-        PERCENT=$(echo "scale=1; ($SAVED * 100) / $OLD_SIZE" | bc -l)
+        PERCENT=$(awk -v s="$SAVED" -v o="$OLD_SIZE" 'BEGIN {printf "%.1f", (s * 100) / o}')
         
         local end_time
         end_time=$(date +%s)
@@ -1827,6 +1834,7 @@ process_file() {
         # Clear TEMP_OUTPUT so cleanup doesn't try to delete it
         TEMP_OUTPUT=""
     else
+        local _fn
         _fn=$(basename "${INPUT:-}")
         [[ -z "$_fn" ]] && _fn="(unknown file)"
         echo -e "${C_RED}❌ Failed to compress $_fn${C_RESET}"
@@ -2267,7 +2275,7 @@ fi
 # Check dependencies
 need ffmpeg
 need ffprobe
-need bc
+need awk
 need numfmt
 
 # Auto-detect encoder if not specified
@@ -2476,7 +2484,7 @@ if [[ -n "${MEMORY_LIMIT:-}" ]]; then
         [[ "$QUIET" != true ]] && info "🧠 Memory limit: ${MEMORY_LIMIT} per ffmpeg process (systemd-run)"
         if ! systemd-run --scope -p MemoryMax=1M -p MemorySwapMax=0 true 2>/dev/null; then
             MEMORY_LIMIT=""
-            [[ "$QUIET" != true ]] && warn "⚠️  systemd-run --scope a échoué (ex. Access denied). Traitement sans limite mémoire."
+            [[ "$QUIET" != true ]] && warn "⚠️  systemd-run --scope failed (e.g. Access denied). Processing without memory limit."
         fi
     else
         [[ "$QUIET" != true ]] && warn "⚠️  --memory-limit ${MEMORY_LIMIT} ignored (Linux + systemd-run required)"
@@ -2506,7 +2514,7 @@ if [ -f "$PROGRESS_FILE" ] && [ -s "$PROGRESS_FILE" ]; then
     done < "$PROGRESS_FILE"
     
     total_saved=$((total_original - total_compressed))
-    avg_percent=$(echo "scale=1; ($total_saved * 100) / $total_original" | bc -l)
+    avg_percent=$(awk -v s="$total_saved" -v o="$total_original" 'BEGIN {printf "%.1f", (s * 100) / o}')
     time_str=$(printf "%02d:%02d:%02d" $((total_time/3600)) $((total_time%3600/60)) $((total_time%60)))
     
     success "✅ Successfully processed: $count file(s)"
@@ -2536,8 +2544,8 @@ if [[ -n "${SKIP_LOG:-}" ]] && [[ -f "$SKIP_LOG" ]]; then
         [[ "$QUIET" != true ]] && info "📋 Skip log kept: $SKIP_LOG"
     elif [[ "$INTERACTIVE" == true ]] && [[ "$QUIET" != true ]]; then
         echo ""
-        read -r -p "Conserver .skipped_shrink_mkv.log pour le prochain passage ? (o/N) " answer
-        [[ "$answer" =~ ^[oOyY] ]] && remove_skip_log=false
+        read -r -p "Keep .skipped_shrink_mkv.log for the next run? (y/N) " answer
+        [[ "$answer" =~ ^[yY] ]] && remove_skip_log=false
     fi
     if [[ "$remove_skip_log" == true ]]; then
         rm -f "$SKIP_LOG"

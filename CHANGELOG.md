@@ -4,6 +4,17 @@ All notable changes to shrink_all_mkv are documented in this file.
 
 ---
 
+## [1.0.1] - 2026-05-23
+
+### Fixed
+- **Cleanup**: Fixed a bug where temporary files in subdirectories were not cleaned up when the script was interrupted in recursive mode.
+- **Localization**: Translated remaining French hardcoded messages to English for consistency.
+- **Dependencies**: Removed `bc` dependency and replaced all math operations with `awk` for better portability.
+- **Process Management**: Improved `pkill` target precision during cleanup to avoid accidentally killing unrelated ffmpeg processes on the system.
+- **Variables**: Fixed global variable clobbering by making `_fn` local inside `process_file()`.
+
+---
+
 ## [1.0.0] - 2026-02-22
 
 First stable release (single-commit history).
