@@ -4,6 +4,13 @@ All notable changes to shrink_all_mkv are documented in this file.
 
 ---
 
+## Unreleased
+
+### Fixed
+- **SVT-AV1 memory pressure**: Added automatic SVT logical processor capping and `--svt-lp <num>` for difficult 4K encodes that can otherwise be killed by the system.
+- **CLI parsing**: Options documented as `--jobs 8`, `--preset 6`, `--crf 30`, `--encoder libsvtav1`, and `--skip-codec hevc` now work in addition to `--option=value`.
+- **Cleanup**: Runtime config cleanup no longer risks deleting the persistent user config, and normal successful exits keep exit code 0.
+
 ## [1.0.1] - 2026-05-23
 
 ### Fixed

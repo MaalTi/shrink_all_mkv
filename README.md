@@ -173,6 +173,9 @@ shrink_all_mkv --hw-encoder --jobs 8 /videos
                          libaom-av1: 0-8 (default: 6, higher=faster)
                          rav1e: 0-10 (default: 6, higher=faster)
 
+--svt-lp <num>           SVT-AV1 logical processors per encode
+                         Default: auto-capped by resolution/jobs to reduce RAM use
+
 --crf <value>            CRF for compression (0-63, lower=better quality)
                          Default: auto-detect based on source quality
 
@@ -330,6 +333,16 @@ shrink_all_mkv --tune-grain --preset 4 --jobs 4 /videos
 ## 🐛 Troubleshooting
 
 ### Files Fail to Encode
+
+**ffmpeg is killed / "Processus arrêté":**
+
+This usually means the system killed `ffmpeg` because the encode used too much RAM, especially with 4K 10-bit SVT-AV1 jobs. Try:
+
+```bash
+shrink_all_mkv --jobs 1 --svt-lp 2 /videos
+```
+
+The script auto-caps SVT-AV1 logical processors by default, but difficult 4K sources may still need a lower manual value.
 
 **Check for multiple video tracks:**
 
