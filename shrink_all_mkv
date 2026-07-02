@@ -71,6 +71,7 @@ PRESET="6"              # Default preset for SVT-AV1 (0-13, higher is faster)
 CRF=""                  # CRF value (auto-detect if empty)
 JOBS=4                  # Number of parallel jobs
 SVT_LP=""               # SVT-AV1 logical processors per encode (auto if empty)
+SVT_LOW_MEMORY=false    # Use lower-memory SVT-AV1 settings
 QUIET=false             # Quiet mode
 HELP=false              # Help flag
 LIST_CODECS=false       # List codecs mode
@@ -162,15 +163,19 @@ get_video_info() {
 
     stream_data=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,bit_rate,width,height,r_frame_rate,pix_fmt \
-        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+        -of default=noprint_wrappers=1 "$file" 2>/dev/null)
     duration=$(ffprobe -v error -show_entries format=duration \
         -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
-    codec=$(echo "$stream_data" | sed -n '1p')
-    bitrate=$(echo "$stream_data" | sed -n '2p')
-    width=$(echo "$stream_data" | sed -n '3p')
-    height=$(echo "$stream_data" | sed -n '4p')
-    fps_frac=$(echo "$stream_data" | sed -n '5p')
-    pix_fmt=$(echo "$stream_data" | sed -n '6p')
+    while IFS='=' read -r key value; do
+        case "$key" in
+            codec_name) codec="$value" ;;
+            bit_rate) bitrate="$value" ;;
+            width) width="$value" ;;
+            height) height="$value" ;;
+            r_frame_rate) fps_frac="$value" ;;
+            pix_fmt) pix_fmt="$value" ;;
+        esac
+    done <<< "$stream_data"
     
     # Calculate FPS from fraction
     local fps="0"
@@ -677,6 +682,36 @@ calculate_svt_lp() {
 
     [ "$lp" -lt 1 ] && lp=1
     echo "$lp"
+}
+
+build_svt_params() {
+    local svt_lp="$1"
+    local low_memory="${2:-false}"
+    local svt_params
+    local overlays=1
+    local tf_param=""
+
+    if [[ "$low_memory" == true ]]; then
+        overlays=0
+        tf_param=":enable-tf=0"
+    fi
+
+    if [[ "$TUNE_GRAIN" == true ]]; then
+        svt_params="tune=4:film-grain=0:enable-overlays=$overlays:scd=1:scm=0:irefresh-type=2:lp=$svt_lp"
+        svt_params="$svt_params:enable-tf=0:enable-restoration=0:enable-cdef=0"
+    else
+        svt_params="tune=0:film-grain=0:enable-overlays=$overlays:scd=1:scm=0:irefresh-type=2:lp=$svt_lp$tf_param"
+        if [[ "$ENABLE_VARBOOST" == true ]]; then
+            svt_params="$svt_params:enable-variance-boost=1:variance-boost-strength=2:variance-octile=6"
+        fi
+    fi
+
+    if [[ "$low_memory" == true ]]; then
+        # Conservative fallback for 4K/10-bit sources that can be killed by the OOM killer.
+        svt_params="$svt_params:lookahead=0:hierarchical-levels=3"
+    fi
+
+    echo "$svt_params"
 }
 
 calculate_adaptive_crf() {
@@ -1732,21 +1767,12 @@ process_file() {
             libsvtav1)
                 encoder_opts="-preset $PRESET -crf $use_crf -g $keyint"
                 
-                local svt_params="tune=0:film-grain=0:enable-overlays=1:scd=1:scm=0:irefresh-type=2"
                 local svt_lp="${SVT_LP:-}"
                 if [[ -z "$svt_lp" ]]; then
                     svt_lp=$(calculate_svt_lp "$width" "$height" "$JOBS")
                 fi
-                svt_params="$svt_params:lp=$svt_lp"
-                
-                if [[ "$ENABLE_VARBOOST" == true ]]; then
-                    svt_params="$svt_params:enable-variance-boost=1:variance-boost-strength=2:variance-octile=6"
-                fi
-                
-                if [[ "$TUNE_GRAIN" == true ]]; then
-                    svt_params="tune=4:film-grain=0:enable-overlays=1:scd=1:scm=0:irefresh-type=2:lp=$svt_lp"
-                    svt_params="$svt_params:enable-tf=0:enable-restoration=0:enable-cdef=0"
-                fi
+                local svt_params
+                svt_params=$(build_svt_params "$svt_lp" "$SVT_LOW_MEMORY")
                 
                 encoder_opts="$encoder_opts -svtav1-params $svt_params"
                 ;;
@@ -1818,6 +1844,40 @@ process_file() {
                 -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
         fi
         local exit_code=${PIPESTATUS[0]}
+    fi
+
+    if { [ "$exit_code" -eq 137 ] || [ "$exit_code" -eq 9 ]; } \
+        && [ "$using_hw" != true ] \
+        && [ "$ENCODER" = "libsvtav1" ] \
+        && [[ "$SVT_LOW_MEMORY" != true ]]; then
+        warn "   ⚠️  ffmpeg was killed. Retrying once with SVT low-memory settings and software decode..."
+        rm -f "$TEMP_OUTPUT"
+        [[ -n "${FFMPEG_ERR:-}" ]] && : > "$FFMPEG_ERR"
+
+        local retry_svt_params
+        retry_svt_params=$(build_svt_params 1 true)
+        encoder_opts="-preset $PRESET -crf $use_crf -g $keyint -svtav1-params $retry_svt_params"
+        hw_decode_opts=""
+
+        if [[ "$QUIET" == true ]] || [[ "$JOBS" -gt 1 ]]; then
+            run_ffmpeg -i "$INPUT" \
+                -pix_fmt "$target_pix_fmt" \
+                -c:v "$ENCODER" $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel error -y "$TEMP_OUTPUT" >/dev/null 2>&1
+            exit_code=$?
+        else
+            run_ffmpeg -i "$INPUT" \
+                -pix_fmt "$target_pix_fmt" \
+                -c:v "$ENCODER" $encoder_opts \
+                -c:a copy \
+                -c:s copy \
+                -map 0:v:0 -map 0:a? -map 0:s? \
+                -loglevel warning -progress pipe:1 -y "$TEMP_OUTPUT" 2>"${FFMPEG_ERR:-/dev/null}" | show_progress "$INPUT" "$duration" "$start_time"
+            exit_code=${PIPESTATUS[0]}
+        fi
     fi
     
     if [ $exit_code -eq 0 ] && [ -f "$TEMP_OUTPUT" ]; then
@@ -1938,6 +1998,7 @@ process_parallel() {
         export -f get_codec_friendly_name
         export -f calculate_adaptive_crf
         export -f calculate_svt_lp
+        export -f build_svt_params
         export -f check_disk_space
         export -f calculate_vmaf
         export -f detect_hardware_av1_encoder
@@ -1949,7 +2010,7 @@ process_parallel() {
         export -f warn
         export -f err
         export -f log_to_file
-        export ENCODER PRESET CRF AUTO_CRF QUIET JOBS SVT_LP
+        export ENCODER PRESET CRF AUTO_CRF QUIET JOBS SVT_LP SVT_LOW_MEMORY
         export USE_HARDWARE HW_ENCODER HW_DECODE HW_DECODE_DEVICE ENABLE_VARBOOST TUNE_GRAIN FORCE_10BIT
         export CALCULATE_VMAF CHECK_DISK_SPACE
         export PROGRESS_FILE STATE_FILE LOG_FILE SKIP_LOG
@@ -1971,8 +2032,9 @@ process_parallel() {
         log "🔄 Processing $files_to_process file(s) with $JOBS parallel jobs"
         echo ""
         
-        export SKIP_LOG MEMORY_LIMIT SVT_LP CPU_THREADS
+        export SKIP_LOG MEMORY_LIMIT SVT_LP SVT_LOW_MEMORY CPU_THREADS
         export -f calculate_svt_lp
+        export -f build_svt_params
         export -f run_ffmpeg
         for file in "${files[@]}"; do
             should_skip_file "$file" && continue
@@ -2082,6 +2144,10 @@ while [[ $# -gt 0 ]]; do
         err "⚠️ Invalid --svt-lp value. It must be between 1 and $CPU_THREADS (current: $SVT_LP)."
       fi
       shift ;;
+    --svt-low-memory)
+      SVT_LOW_MEMORY=true
+      [[ -z "$SVT_LP" ]] && SVT_LP=1
+      shift ;;
     --interactive|-i)
       INTERACTIVE=true
       shift ;;
@@ -2186,6 +2252,9 @@ if [[ "$HELP" == true ]]; then
 
     --svt-lp <num>        SVT-AV1 logical processors per encode
                           Default: auto-capped by resolution/jobs to reduce RAM use
+
+    --svt-low-memory      Use conservative SVT-AV1 settings for difficult 4K/10-bit encodes
+                          Also forces --svt-lp 1 unless --svt-lp was explicitly set
     
     --crf <value>         CRF for compression (0-63, lower=better quality)
                           Default: auto-detect based on source quality
@@ -2265,6 +2334,9 @@ EOF
 
     # Reduce RAM use for difficult 4K encodes
     $(basename "$0") --jobs 1 --svt-lp 2 /path/to/videos
+
+    # Maximum memory reduction for 4K/10-bit sources
+    $(basename "$0") --jobs 1 --svt-low-memory /path/to/videos
 
     # Use 8 parallel jobs with libaom-av1 encoder
     $(basename "$0") --encoder libaom-av1 --jobs 8 /path/to/videos
@@ -2463,6 +2535,9 @@ log "🎯 Encoder: $ENCODER"
 log "⚙️  Preset: $PRESET"
 if [[ "$ENCODER" == "libsvtav1" ]]; then
     log "🧵 SVT logical processors: ${SVT_LP:-auto}"
+    if [[ "$SVT_LOW_MEMORY" == true ]]; then
+        log "🧠 SVT low-memory mode: enabled"
+    fi
 fi
 log "🎚️  CRF: ${CRF:-auto-detect}"
 if [[ "$FORCE_10BIT" == true ]]; then

@@ -176,6 +176,9 @@ shrink_all_mkv --hw-encoder --jobs 8 /videos
 --svt-lp <num>           SVT-AV1 logical processors per encode
                          Default: auto-capped by resolution/jobs to reduce RAM use
 
+--svt-low-memory         Use conservative SVT-AV1 settings for difficult 4K/10-bit encodes
+                         Also forces --svt-lp 1 unless --svt-lp was explicitly set
+
 --crf <value>            CRF for compression (0-63, lower=better quality)
                          Default: auto-detect based on source quality
 
@@ -342,7 +345,13 @@ This usually means the system killed `ffmpeg` because the encode used too much R
 shrink_all_mkv --jobs 1 --svt-lp 2 /videos
 ```
 
-The script auto-caps SVT-AV1 logical processors by default, but difficult 4K sources may still need a lower manual value.
+If it still fails, use the stronger low-memory mode:
+
+```bash
+shrink_all_mkv --jobs 1 --svt-low-memory /videos
+```
+
+The script auto-caps SVT-AV1 logical processors by default and retries once with low-memory settings after a kill, but difficult 4K sources may still need this option from the start.
 
 **Check for multiple video tracks:**
 
