@@ -265,13 +265,13 @@ shrink_all_mkv --hw-decode --auto-jobs --notify /videos
 
 ## 🎯 Preset Guide
 
-| Preset | Speed | Quality | Use Case |
-|--------|-------|---------|----------|
-| 0-3 | Very Slow | Excellent | Archival, masters |
-| 4 | Slow | Very Good | High quality encodes |
-| **6** | **Balanced** | **Good** | **Recommended default** |
-| 8 | Fast | Good | Large batches |
-| 10-13 | Very Fast | Acceptable | Quick conversions |
+| Preset | Speed        | Quality    | Use Case                |
+|--------|--------------|------------|-------------------------|
+| 0-3    | Very Slow    | Excellent  | Archival, masters       |
+| 4      | Slow         | Very Good  | High quality encodes    |
+| **6**  | **Balanced** | **Good**   | **Recommended default** |
+| 8      | Fast         | Good       | Large batches           |
+| 10-13  | Very Fast    | Acceptable | Quick conversions       |
 
 **Recommendation:** Use preset 6 for best balance. Use 4 for high quality, 8 for speed.
 
@@ -279,12 +279,12 @@ shrink_all_mkv --hw-decode --auto-jobs --notify /videos
 
 ## 💾 CRF Guide (Auto-detected by default)
 
-| CRF | Quality | Typical Use |
-|-----|---------|-------------|
-| 20-25 | Excellent | High quality, larger files |
-| 26-30 | Very Good | Balanced (typical auto-detect range) |
-| 31-35 | Good | Space savings priority |
-| 36-40 | Acceptable | Maximum compression |
+| CRF   | Quality    | Typical Use                          |
+|-------|------------|--------------------------------------|
+| 20-25 | Excellent  | High quality, larger files           |
+| 26-30 | Very Good  | Balanced (typical auto-detect range) |
+| 31-35 | Good       | Space savings priority               |
+| 36-40 | Acceptable | Maximum compression                  |
 
 **Note:** Script auto-detects CRF based on source resolution and quality. Manual override available if needed.
 
@@ -304,6 +304,18 @@ HW_DECODE=true
 ```
 
 ---
+
+## 📚 Community
+
+This project follows common GitHub community standards. Please read these files before contributing or reporting issues:
+
+- `CONTRIBUTING.md` — Contribution guidelines and PR process
+- `CODE_OF_CONDUCT.md` — Community behaviour expectations
+- `SECURITY.md` — How to report security issues privately
+- `LICENSE` — Project license (MIT)
+- Issue and PR templates are available under `.github/` to help format reports and requests
+
+Thank you for helping keep the project friendly and secure!
 
 ## 📊 Performance Tips
 
@@ -409,19 +421,19 @@ nvidia-smi
 
 | Source Codec | Quality | Typical Savings |
 |--------------|---------|-----------------|
-| H.264 (x264) | High | 30-40% |
-| H.264 (x264) | Medium | 40-50% |
-| H.265 (x265) | High | 10-20% |
-| VP9 | High | 5-15% |
-| MPEG-2 | Any | 60-70% |
+| H.264 (x264) | High    | 30-40%          |
+| H.264 (x264) | Medium  | 40-50%          |
+| H.265 (x265) | High    | 10-20%          |
+| VP9          | High    | 5-15%           |
+| MPEG-2       | Any     | 60-70%          |
 
 ### Encoding Speed (CPU, preset 6, 1080p)
 
 | CPU Cores | Expected Speed |
 |-----------|----------------|
-| 4 cores | ~10-15 fps |
-| 8 cores | ~20-30 fps |
-| 16 cores | ~40-60 fps |
+| 4 cores   | ~10-15 fps     |
+| 8 cores   | ~20-30 fps     |
+| 16 cores  | ~40-60 fps     |
 
 **With hardware decode:** Add 15-25% to speeds above
 

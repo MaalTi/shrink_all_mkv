@@ -3,6 +3,9 @@
 # Version: 1.0.0
 # 
 # This script demonstrates various usage patterns and features.
+#
+# Community files: CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, and LICENSE are included in the repository.
+# Please read `CONTRIBUTING.md` before opening pull requests or issues.
 # Choose a scenario that matches your needs!
 
 set -e  # Exit on error

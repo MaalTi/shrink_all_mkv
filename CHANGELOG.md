@@ -7,6 +7,15 @@ All notable changes to shrink_all_mkv are documented in this file.
 ## Unreleased
 
 ### Fixed
+
+-
+
+### Added
+
+- **Community**: Added GitHub community files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue templates, PR template, and `LICENSE` (MIT).
+
+### Fixed
+
 - **SVT-AV1 OOM retry**: Added `--svt-low-memory` and an automatic low-memory retry without hardware decode when SVT-AV1 is killed.
 - **ffprobe parsing**: Fixed video info parsing when FFprobe returns stream fields in an unexpected order.
 - **SVT-AV1 memory pressure**: Added automatic SVT logical processor capping and `--svt-lp <num>` for difficult 4K encodes that can otherwise be killed by the system.
@@ -16,6 +25,7 @@ All notable changes to shrink_all_mkv are documented in this file.
 ## [1.0.1] - 2026-05-23
 
 ### Fixed
+
 - **Cleanup**: Fixed a bug where temporary files in subdirectories were not cleaned up when the script was interrupted in recursive mode.
 - **Localization**: Translated remaining French hardcoded messages to English for consistency.
 - **Dependencies**: Removed `bc` dependency and replaced all math operations with `awk` for better portability.
